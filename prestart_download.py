@@ -3,7 +3,7 @@ from pathlib import Path
 import os, sys, requests
 
 DB_PATH = Path(os.getenv("DB_PATH", "ventas2025.sqlite"))
-DB_URL  = os.getenv("DB_URL", "").strip()
+DB_URL = "https://drive.google.com/uc?export=download&id=1N_pnmmvYo7xPJB0gT6Dhl1ITCERw4cVW"
 
 if DB_PATH.exists():
     print(f"[prestart] DB ya existe -> {DB_PATH.resolve()}")
@@ -21,3 +21,4 @@ with requests.get(DB_URL, stream=True) as r:
             if chunk:
                 f.write(chunk)
 print("[prestart] Descarga completa.")
+
