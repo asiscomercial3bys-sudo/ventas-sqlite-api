@@ -7,18 +7,25 @@ from datetime import datetime
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---------- rutas y seguridad ----------
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "ventas2025.sqlite"   # Ruta relativa (para Render y local)
 
-API_KEY = os.getenv("API_KEY")  # en Render la defines
+# Modo público: si es "1" no exige token desde ningún cliente
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "1") == "1"
+API_KEY = os.getenv("API_KEY")  # solo se usa si PUBLIC_MODE=False
+
 def require_auth(authorization: str = Header(None)):
     """
-    Auth tipo Bearer. Si no hay API_KEY en el entorno (entorno local), no exige auth.
+    Si PUBLIC_MODE es True => no exige auth.
+    Si PUBLIC_MODE es False => exige encabezado Bearer y que coincida con API_KEY.
     """
-    if not API_KEY:
+    if PUBLIC_MODE:
         return
+    if not API_KEY:
+        return  # sin API_KEY definida, no se exige auth (backdoor controlado)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Falta Authorization: Bearer <token>")
     token = authorization.split(" ", 1)[1].strip()
@@ -32,13 +39,23 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.0.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.1.0")
+
+# CORS: abierto para cualquier origen (puedes restringir a dominios específicos si quieres)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------- util db ----------
 def get_conn():
     if not DB_PATH.exists():
         raise HTTPException(500, f"No existe la base en {DB_PATH}")
-    return sqlite3.connect(str(DB_PATH))
+    # Para evitar bloqueos de thread con Uvicorn
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
 def list_tables() -> List[str]:
     with get_conn() as conn:
@@ -93,10 +110,10 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Fecha
     m["Fecha"] = (norm_map.get(normalize("Fecha")) or
                   pick_fuzzy(norm_map, "fecha", "fechaventa", "date"))
-    # Grupo de inventario / Portafolio (usaremos esta para filtrar por grupo)
+    # Grupo de inventario / Portafolio
     m["GrupoInventario"] = (norm_map.get(normalize("Grupo inventario")) or
                             pick_fuzzy(norm_map, "grupoinventario", "grupo", "linea", "categoria"))
-    # Portafolio (por compatibilidad con tu reporte)
+    # Portafolio (compat)
     m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
     # Producto
     m["Producto"] = (norm_map.get(normalize("Nombre producto")) or
@@ -105,13 +122,11 @@ def map_columns(tbl: str) -> Dict[str,str]:
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
                      pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
     # Valores
-    m["Subtotal"]   = norm_map.get(normalize("Subtotal"))
+    m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
-    # Validaciones mínimas
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
     if missing:
         raise HTTPException(400, f"Faltan columnas mínimas en [{tbl}]: {missing}. Revisa nombres.")
-
     return m
 
 # ---------- modelos ----------
@@ -147,9 +162,6 @@ COLS  = map_columns(TABLA)
 
 # ---------- helpers SQL ----------
 def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
-    """
-    Crea SELECT base con columnas estandarizadas.
-    """
     cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]; qty_col = COLS["Cantidad"]
     pro_col = COLS["Producto"]; grp_col = COLS["GrupoInventario"]
     sel = [
@@ -166,7 +178,6 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
     return sql, []
 
 def ensure_period(desde: str, hasta: str):
-    # Validación simple yyyy-mm-dd
     for d in (desde, hasta):
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
             raise HTTPException(422, "Formato de fecha inválido. Usa YYYY-MM-DD.")
@@ -179,7 +190,7 @@ def extract_digits(s: str) -> str:
 # ---------- endpoints básicos ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "db": str(DB_PATH), "tabla": TABLA, "cols": COLS}
+    return {"ok": True, "public": PUBLIC_MODE, "db": str(DB_PATH), "tabla": TABLA, "cols": COLS}
 
 @app.get("/tablas")
 def tablas():
@@ -194,24 +205,17 @@ def schema():
 # ---------- consulta cliente (solo SUBTOTAL) ----------
 @app.get("/consulta_cliente", response_model=ResumenCliente, dependencies=[Depends(require_auth)])
 def consulta_cliente(
-    # puedes enviar uno u otro:
     cliente: Optional[str] = Query(None, min_length=2, description="Nombre o parte del nombre"),
     identificacion: Optional[str] = Query(None, description="Identificación exacta o parcial (solo números serán usados)"),
     desde: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     grupo_inventario: Optional[str] = Query(None, description="Filtra por grupo de inventario (opcional)")
 ):
-    """
-    Busca por NOMBRE o por IDENTIFICACIÓN (preferencia por identificación si viene).
-    Usa SIEMPRE el SUBTOTAL como valor de ventas.
-    Incluye desglose mensual.
-    """
     ensure_period(desde, hasta)
     val_col = COLS.get("Subtotal")
     if not val_col:
         raise HTTPException(500, "No existe columna Subtotal en la base. Corrige la estructura.")
 
-    # Filtros
     cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]; grp_col = COLS["GrupoInventario"]
     id_col  = COLS.get("Identificacion")
 
@@ -228,9 +232,6 @@ def consulta_cliente(
         ident_digits = extract_digits(identificacion)
         if not ident_digits:
             raise HTTPException(422, "Identificación inválida (no se encontraron dígitos).")
-        # Si la columna tiene más info (ej. +Suc), comparamos por dígitos
-        # Construimos un filtro que compare solo dígitos de la columna
-        # En SQLite no hay regex nativa; hacemos LIKE flexible:
         where.append(f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE([{id_col}], '-', ''), '.', ''), ' ', ''), '/', ''), '+', '') LIKE ?")
         params.append(f"%{ident_digits}%")
         filtro_det = f"Identificación ~ {ident_digits}"
@@ -254,7 +255,6 @@ def consulta_cliente(
     if df.empty:
         raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
 
-    # Si entró por identificación y además tenemos columna de identificación, determinamos el identificador "líder"
     if identificacion and id_col:
         with get_conn() as conn:
             df_id = pd.read_sql(
@@ -263,32 +263,26 @@ def consulta_cliente(
                 conn, params=[desde, hasta]
             )
         if not df_id.empty:
-            # elegimos la moda del nombre dentro de df (para evitar homónimos)
             cliente_det = df["Cliente"].value_counts().idxmax()
             cliente_id_det = df_id[df_id["Cliente"] == cliente_det]["Ident"].value_counts().idxmax()
     else:
-        # entró por nombre: fijamos el nombre dominante para evitar mezclar homónimos
         cliente_det = df["Cliente"].value_counts().idxmax()
 
     if cliente_det is not None:
         df = df[df["Cliente"] == cliente_det].copy()
 
-    # Normalización numérica
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0.0)
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
 
-    # Totales
     total_unidades = float(df["Cantidad"].sum())
     total_valor    = float(df["Subtotal"].sum())
     ticket_prom    = float(total_valor / total_unidades) if total_unidades else 0.0
 
-    # Por grupo inventario
     por_grupo = (
         df.groupby("GrupoInventario", dropna=False)["Subtotal"]
           .sum().sort_values(ascending=False).round(2).to_dict()
     )
 
-    # Top productos del cliente
     top_prod_df = (
         df.groupby("Producto", dropna=False)["Subtotal"]
           .sum().sort_values(ascending=False).head(10).reset_index()
@@ -302,9 +296,7 @@ def consulta_cliente(
         for _, r in top_prod_df.iterrows()
     ]
 
-    # Desglose mensual
     def to_month(s: pd.Series) -> pd.Series:
-        # soporta texto/timestamp
         return pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m")
 
     df["YYYYMM"] = to_month(df["Fecha"])
@@ -325,7 +317,7 @@ def consulta_cliente(
         mensual_unidades={k: float(v) for k, v in mens_qty.items()}
     )
 
-# ---------- informe (formato amigable / sigue usando SOLO SUBTOTAL) ----------
+# ---------- informe (texto) ----------
 @app.get("/informe_cliente", dependencies=[Depends(require_auth)])
 def informe_cliente(
     cliente: Optional[str] = None,
@@ -342,9 +334,7 @@ def informe_cliente(
             return {"informe": f"No encontré ventas para '{target}' en {desde} → {hasta}."}
         raise
 
-    lineas = [
-        f"🧾 Informe de cliente",
-    ]
+    lineas = [ "🧾 Informe de cliente" ]
     if r.cliente_id:
         lineas.append(f"Cliente: {r.cliente} (ID: {r.cliente_id})")
     else:
@@ -368,7 +358,6 @@ def informe_cliente(
     for i, tp in enumerate(r.top_productos[:10], 1):
         lineas.append(f"  {i}. {tp.nombre} — ${tp.valor:,.2f}")
 
-    # Mensual
     lineas.append("")
     lineas.append("Mensual (Subtotal):")
     for m, v in sorted(r.mensual_ventas.items()):
@@ -376,7 +365,7 @@ def informe_cliente(
 
     return {"informe": "\n".join(lineas)}
 
-# ---------- TOPS globales (clientes / productos) ----------
+# ---------- TOPS globales ----------
 @app.get("/tops", response_model=TopRespuesta, dependencies=[Depends(require_auth)])
 def tops(
     entidad: Literal["clientes","productos"] = Query(..., description="Entidad objetivo del top"),
@@ -387,13 +376,6 @@ def tops(
     grupo_inventario: Optional[str] = Query(None, description="Filtro opcional por grupo de inventario"),
     limite: int = Query(10, ge=1, le=100)
 ):
-    """
-    Devuelve TOPS globales por subtotal:
-      - entidad: 'clientes' o 'productos'
-      - orden: 'mas' (desc) o 'menos' (asc)
-      - frecuencia: 'mensual' (YYYY-MM) o 'anual' (sum periodo)
-    Permite filtrar por grupo de inventario y rango de fechas.
-    """
     ensure_period(desde, hasta)
     val_col = COLS.get("Subtotal")
     if not val_col:
@@ -410,7 +392,6 @@ def tops(
 
     target_col = f"[{cli_col}]" if entidad == "clientes" else f"[{pro_col}]"
 
-    # Selección base
     base_sel = [
         f"{target_col} AS Nombre",
         f"CAST([{val_col}] AS FLOAT) AS Subtotal",
@@ -440,7 +421,6 @@ def tops(
     if frecuencia == "mensual":
         df["Periodo"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m")
         g = df.groupby(["Periodo","Nombre"], dropna=False)["Subtotal"].sum().reset_index()
-        # Orden por periodo y subtotal
         resultado: List[Dict[str, object]] = []
         for periodo, chunk in g.groupby("Periodo"):
             chunk = chunk.sort_values("Subtotal", ascending=(orden == "menos"))
@@ -448,7 +428,6 @@ def tops(
             for _, r in head.iterrows():
                 resultado.append({"periodo": periodo, "nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))})
     else:
-        # anual / periodo total
         g = df.groupby("Nombre", dropna=False)["Subtotal"].sum().reset_index()
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
         resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
