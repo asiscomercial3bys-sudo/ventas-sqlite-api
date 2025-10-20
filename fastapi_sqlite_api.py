@@ -2,7 +2,6 @@
 from pathlib import Path
 import sqlite3, re, unicodedata, os
 from typing import Dict, List, Optional, Literal, Tuple
-from datetime import datetime
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -11,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---------- rutas y seguridad ----------
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "ventas2025.sqlite"   # Ruta relativa (para Render y local)
+DB_PATH = BASE_DIR / "ventas2025.sqlite"   # Ruta relativa (Render y local)
 
 # Modo público: si es "1" no exige token desde ningún cliente
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "1") == "1"
@@ -34,14 +33,14 @@ def require_auth(authorization: str = Header(None)):
 
 # ---------- config ----------
 DEFAULT_TABLE_HINTS = [
-    "comparativo_emp._2024_vs_2025",  # pista principal
+    "comparativo_emp._2024_vs_2025",
     "ventas_2025", "ventas", "reporte", "hoja1"
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.1.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.2.0")
 
-# CORS: abierto para cualquier origen (puedes restringir a dominios específicos si quieres)
+# CORS abierto (ajusta dominios si luego quieres limitar)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,7 +53,7 @@ app.add_middleware(
 def get_conn():
     if not DB_PATH.exists():
         raise HTTPException(500, f"No existe la base en {DB_PATH}")
-    # Para evitar bloqueos de thread con Uvicorn
+    # Evitar bloqueos de thread con Uvicorn
     return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
 def list_tables() -> List[str]:
@@ -71,6 +70,7 @@ def normalize(s: str) -> str:
 
 def strip_accents_spaces_lower(s: str) -> str:
     if s is None: return ""
+    import unicodedata
     s = unicodedata.normalize("NFKD", str(s))
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower().replace(" ", "")
 
@@ -121,7 +121,7 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Cantidad
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
                      pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
-    # Valores
+    # Valores (SOLO Subtotal)
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
@@ -252,8 +252,9 @@ def consulta_cliente(
     with get_conn() as conn:
         df = pd.read_sql(base_sql, conn, params=params)
 
-    if df.empty:
-        raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
+    # --- Solo Subtotal: si no hay datos útiles, 404
+    if df.empty or pd.to_numeric(df.get("Subtotal"), errors="coerce").fillna(0).sum() == 0:
+        raise HTTPException(404, "No hay registros con valores en el campo 'Subtotal' para este filtro.")
 
     if identificacion and id_col:
         with get_conn() as conn:
@@ -409,13 +410,13 @@ def tops(
     with get_conn() as conn:
         df = pd.read_sql(base_sql, conn, params=params)
 
+    # --- Solo Subtotal: si no hay datos útiles, 404
     if df.empty:
-        return TopRespuesta(
-            entidad=entidad, orden=orden, frecuencia=frecuencia,
-            desde=desde, hasta=hasta, grupo_inventario=grupo_inventario, top=[]
-        )
-
+        raise HTTPException(404, "No hay registros para el periodo/filtro indicado.")
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
+    if df["Subtotal"].sum() == 0:
+        raise HTTPException(404, "No hay valores en 'Subtotal' para el periodo/filtro indicado.")
+
     df["Nombre"] = df["Nombre"].fillna("N/A")
 
     if frecuencia == "mensual":
