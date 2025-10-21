@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.3.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.4.0")
 
 # CORS abierto (ajusta dominios si luego quieres limitar)
 app.add_middleware(
@@ -173,23 +173,7 @@ class TopRespuesta(BaseModel):
 TABLA = pick_table()
 COLS  = map_columns(TABLA)
 
-# ---------- helpers SQL ----------
-def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
-    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]; qty_col = COLS["Cantidad"]
-    pro_col = COLS["Producto"]; grp_col = COLS["GrupoInventario"]
-    sel = [
-        f"[{cli_col}]  AS Cliente",
-        f"[{fec_col}]  AS Fecha",
-        f"[{grp_col}]  AS GrupoInventario" if grp_col else "'N/A' AS GrupoInventario",
-        f"[{pro_col}]  AS Producto",
-        f"CAST([{qty_col}] AS FLOAT)  AS Cantidad",
-        f"CAST([{val_col}] AS FLOAT)  AS Subtotal"
-    ]
-    if select_cols:
-        sel = select_cols
-    sql = f"SELECT {', '.join(sel)} FROM [{TABLA}] WHERE 1=1 {extra_where}"
-    return sql, []
-
+# ---------- helpers ----------
 def ensure_period(desde: str, hasta: str):
     for d in (desde, hasta):
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
@@ -199,6 +183,47 @@ def ensure_period(desde: str, hasta: str):
 
 def extract_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s))
+
+def sql_number(col: str) -> str:
+    """
+    Convierte texto monetario/numérico a float en SQLite:
+    - quita símbolos ($, espacios, #, *, paréntesis)
+    - maneja LATAM (1.234.567,89) y EN (1,234,567.89)
+    """
+    base = (
+        f"replace(replace(replace(replace(replace(replace(replace(replace(replace(replace("
+        f"replace([{col}], '$',''), ' ', ''), '#',''), '*',''), '(', ''), ')',''), '\\n',''), '\\t',''), ' ',''), chr(160), ''), '\u00A0','')"
+    )
+    latam = f"cast(replace(replace({base}, '.', ''), ',', '.') as float)"
+    enfmt = f"cast(replace({base}, ',', '') as float)"
+    only_comma = f"cast(replace({base}, ',', '.') as float)"
+    return f"(case when instr({base}, ',')>0 and instr({base}, '.')>0 then {latam} " \
+           f"when instr({base}, ',')>0 and instr({base}, '.')=0 then {only_comma} else {enfmt} end)"
+
+# ---------- helpers SQL ----------
+def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
+    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]; qty_col = COLS["Cantidad"]
+    pro_col = COLS["Producto"]; grp_col = COLS["GrupoInventario"]
+
+    qty_expr = sql_number(qty_col)
+    val_expr = sql_number(val_col)
+
+    sel = [
+        f"[{cli_col}]  AS Cliente",
+        f"[{fec_col}]  AS Fecha",
+        f"[{pro_col}]  AS Producto",
+        f"{qty_expr}  AS Cantidad",
+        f"{val_expr}  AS Subtotal",
+    ]
+    if grp_col:
+        sel.insert(2, f"[{grp_col}] AS GrupoInventario")
+    else:
+        sel.insert(2, "'N/A' AS GrupoInventario")
+
+    if select_cols:
+        sel = select_cols
+    sql = f"SELECT {', '.join(sel)} FROM [{TABLA}] WHERE 1=1 {extra_where}"
+    return sql, []
 
 # ---------- endpoints básicos ----------
 @app.get("/health")
@@ -239,16 +264,17 @@ def consulta_cliente(
     cliente_det = None
     cliente_id_det = None
 
+    clean_sql = None
+    ident_digits = None
+
     if identificacion:
         if not id_col:
             raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
 
-        # 1) del parámetro: quedarnos solo con dígitos
         ident_digits = extract_digits(identificacion)
         if not ident_digits:
             raise HTTPException(422, "Identificación inválida (no se encontraron dígitos).")
 
-        # 2) del campo en la base: quitar TODO lo que no suma (., -, /, +, espacios, paréntesis, comas, _, #, *)
         clean_sql = (
             f"lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace("
             f"replace([{id_col}], '-', ''), '.', ''), ' ', ''), '/', ''), '+', ''), ',', ''), '(', ''), ')', ''), '_', ''), '#', ''), '*', ''))"
@@ -269,16 +295,38 @@ def consulta_cliente(
         where.append(f"lower([{grp_col}]) = lower(?)")
         params.append(grupo_inventario)
 
+    # 1) Si viniste por identificación, primero valida existencia de filas (independiente de Subtotal)
+    if identificacion:
+        with get_conn() as conn:
+            exist_sql = f"""
+                SELECT 1
+                FROM [{TABLA}]
+                WHERE date([{fec_col}]) BETWEEN ? AND ?
+                  AND {clean_sql} LIKE ?
+                LIMIT 1
+            """
+            exists = pd.read_sql(exist_sql, conn, params=[desde, hasta, f"%{ident_digits}%"])
+            if exists.empty:
+                raise HTTPException(404, f"No se encontró la identificación enviada en el período: {ident_digits}.")
+
+    # 2) Consulta principal con Subtotal ya normalizado
     extra_where = " AND " + " AND ".join(where)
     base_sql, _ = build_base_select(val_col, extra_where=extra_where)
 
     with get_conn() as conn:
         df = pd.read_sql(base_sql, conn, params=params)
 
-    # --- Solo Subtotal: si no hay datos útiles, 404
-    if df.empty or pd.to_numeric(df.get("Subtotal"), errors="coerce").fillna(0).sum() == 0:
+    if df.empty:
+        # Si llegamos aquí y está vacío, es porque los filtros adicionales (grupo, etc.) lo vaciaron
+        raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
+
+    # Validación de Subtotal > 0 (ya llega como número real desde SQL)
+    if df["Subtotal"].fillna(0).sum() == 0:
+        if identificacion:
+            raise HTTPException(404, f"La identificación coincide, pero 'Subtotal' es 0/vacío en el período {desde} → {hasta}.")
         raise HTTPException(404, "No hay registros con valores en el campo 'Subtotal' para este filtro.")
 
+    # Resolver homónimos y set de cliente/ID
     if identificacion and id_col:
         with get_conn() as conn:
             df_id = pd.read_sql(
@@ -295,6 +343,7 @@ def consulta_cliente(
     if cliente_det is not None:
         df = df[df["Cliente"] == cliente_det].copy()
 
+    # Seguridad extra (ya vienen normalizados)
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0.0)
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
 
@@ -320,10 +369,7 @@ def consulta_cliente(
         for _, r in top_prod_df.iterrows()
     ]
 
-    def to_month(s: pd.Series) -> pd.Series:
-        return pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m")
-
-    df["YYYYMM"] = to_month(df["Fecha"])
+    df["YYYYMM"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m")
     mens_val = df.groupby("YYYYMM", dropna=False)["Subtotal"].sum().round(2).to_dict()
     mens_qty = df.groupby("YYYYMM", dropna=False)["Cantidad"].sum().round(2).to_dict()
 
@@ -418,7 +464,7 @@ def tops(
 
     base_sel = [
         f"{target_col} AS Nombre",
-        f"CAST([{val_col}] AS FLOAT) AS Subtotal",
+        f"{sql_number(val_col)} AS Subtotal",
         f"[{fec_col}] AS Fecha"
     ]
     if grp_col:
@@ -433,7 +479,6 @@ def tops(
     with get_conn() as conn:
         df = pd.read_sql(base_sql, conn, params=params)
 
-    # --- Solo Subtotal: si no hay datos útiles, 404
     if df.empty:
         raise HTTPException(404, "No hay registros para el periodo/filtro indicado.")
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
