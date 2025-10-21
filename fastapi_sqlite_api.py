@@ -38,9 +38,9 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.6.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.4.1")
 
-# CORS abierto (ajústalo si quieres limitar orígenes)
+# CORS abierto
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,6 +53,7 @@ app.add_middleware(
 def get_conn():
     if not DB_PATH.exists():
         raise HTTPException(500, f"No existe la base en {DB_PATH}")
+    # Evitar bloqueos de thread con Uvicorn
     return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
 def list_tables() -> List[str]:
@@ -98,26 +99,42 @@ def map_columns(tbl: str) -> Dict[str,str]:
     norm_map = {normalize(c): c for c in names}
 
     m: Dict[str,str] = {}
+    # Cliente (nombre)
     m["Cliente"] = (norm_map.get(normalize("Nombre cliente")) or
                     pick_fuzzy(norm_map, "nombre cliente", "cliente", "cliente/mes"))
+
+    # Identificación (ampliamos alias comunes)
     m["Identificacion"] = (
         norm_map.get(normalize("Identificación")) or
         norm_map.get(normalize("Identificacion"))  or
-        pick_fuzzy(norm_map,
-            "identificacion+suc","identificacion","nit","nitcliente","rut","ruc",
-            "dni","cedula","cedulacliente","doc","documento","numdocumento",
-            "idcliente","clienteid","nrodoc","numero documento","no documento"
+        pick_fuzzy(
+            norm_map,
+            "identificacion+suc", "identificacion", "nit", "nitcliente", "rut", "ruc",
+            "dni", "cedula", "cedulacliente", "doc", "documento", "numdocumento",
+            "idcliente", "clienteid", "nrodoc", "numero documento", "no documento"
         )
     )
+
+    # Fecha
     m["Fecha"] = (norm_map.get(normalize("Fecha")) or
                   pick_fuzzy(norm_map, "fecha", "fechaventa", "date"))
+
+    # Grupo de inventario / Portafolio
     m["GrupoInventario"] = (norm_map.get(normalize("Grupo inventario")) or
                             pick_fuzzy(norm_map, "grupoinventario", "grupo", "linea", "categoria"))
+
+    # Portafolio (compat)
     m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
+
+    # Producto
     m["Producto"] = (norm_map.get(normalize("Nombre producto")) or
                      pick_fuzzy(norm_map, "nombreproducto", "producto", "codigo", "codigoproducto"))
+
+    # Cantidad
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
                      pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
+
+    # Valores (SOLO Subtotal)
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
@@ -140,8 +157,8 @@ class ResumenCliente(BaseModel):
     ticket_promedio: float
     ventas_por_grupo: Dict[str, float]
     top_productos: List[TopItem]
-    mensual_ventas: Dict[str, float]
-    mensual_unidades: Dict[str, float]
+    mensual_ventas: Dict[str, float]   # YYYY-MM -> subtotal
+    mensual_unidades: Dict[str, float] # YYYY-MM -> qty
 
 class TopRespuesta(BaseModel):
     entidad: Literal["clientes","productos"]
@@ -150,7 +167,7 @@ class TopRespuesta(BaseModel):
     desde: str
     hasta: str
     grupo_inventario: Optional[str] = None
-    top: List[Dict[str, object]]
+    top: List[Dict[str, object]]     # [{periodo?, nombre, valor}]
 
 # ---------- autodetección ----------
 TABLA = pick_table()
@@ -169,40 +186,28 @@ def extract_digits(s: str) -> str:
 
 def sql_number(col: str) -> str:
     """
-    Normaliza texto numérico/monetario a FLOAT (compatible con SQLite "puro").
-    Soporta:
-      - LATAM: 1.234.567,89  -> 1234567.89
-      - EN:    1,234,567.89  -> 1234567.89
-    NO usa char() ni escapes raros.
+    Convierte texto monetario/numérico a float en SQLite sin usar funciones no soportadas.
+    Maneja:
+      - LATAM: 1.234.567,89
+      - EN:    1,234,567.89
+    Limpia símbolos: $, espacios (incluido NBSP), #, *, (), saltos.
     """
-    # Limpieza base: quita símbolos comunes; NO incluye saltos de línea/tabs para máxima compatibilidad.
-    base = (
-        "replace("
-          "replace("
-            "replace("
-              "replace("
-                "replace("
-                  "replace("
-                    "replace("
-                      "replace("
-                        f"[{col}], '$',''"
-                      "), ' ', ''"
-                    "), '#',''"
-                  "), '*',''"
-                "), '(', ''"
-              "), ')',''"
-            "), '-', ''"
-          "), '/', ''"
-        "), '+', ''"
+    # NBSP literal ' ' (u00A0) incluido directamente en el string
+    # NO quitamos ',' ni '.' en 'clean' para poder decidir el formato después.
+    clean = (
+        f"replace(replace(replace(replace(replace(replace(replace(replace(replace([{col}],"
+        f"'$',''),' ',''),' ','') , '#',''), '*',''), '(' ,''), ')',''), char(10), ''), char(9), '')"
     )
-    latam = f"cast(replace(replace({base}, '.', ''), ',', '.') as float)"   # 1.234,56 -> 1234.56
-    only_comma = f"cast(replace({base}, ',', '.') as float)"               # 1234,56  -> 1234.56
-    en = f"cast(replace({base}, ',', '') as float)"                        # 1,234.56 -> 1234.56
+    # Si tiene coma y punto -> LATAM: quitar puntos (miles) y cambiar coma por punto
+    latam = f"cast(replace(replace({clean}, '.', ''), ',', '.') as float)"
+    # Si tiene solo coma -> usar coma como decimal
+    only_comma = f"cast(replace({clean}, ',', '.') as float)"
+    # En otro caso -> EN: quitar comas (miles)
+    enfmt = f"cast(replace({clean}, ',', '') as float)"
     return (
-        f"(case "
-        f"when instr({base}, ',')>0 and instr({base}, '.')>0 then {latam} "
-        f"when instr({base}, ',')>0 and instr({base}, '.')=0 then {only_comma} "
-        f"else {en} end)"
+        f"(case when instr({clean}, ',')>0 and instr({clean}, '.')>0 then {latam} "
+        f" when instr({clean}, ',')>0 and instr({clean}, '.')=0 then {only_comma} "
+        f" else {enfmt} end)"
     )
 
 # ---------- helpers SQL ----------
@@ -237,12 +242,15 @@ def health():
 
 @app.get("/debug_ping")
 def debug_ping():
-    """Pequeño ping de diagnóstico para ver si el SELECT básico funciona."""
-    fec_col = COLS["Fecha"]; val_col = COLS["Subtotal"]
-    sql = f"SELECT count(*) as n FROM [{TABLA}] WHERE [{fec_col}] IS NOT NULL"
+    # chequeo rápido de tabla/fecha
+    fec_col = COLS["Fecha"]
+    sql = f'SELECT count(*) as n FROM [{TABLA}] WHERE [{fec_col}] IS NOT NULL'
     with get_conn() as conn:
-        df = pd.read_sql(sql, conn)
-    return {"sql": sql, "count": int(df.iloc[0]["n"])}
+        try:
+            df = pd.read_sql(sql, conn)
+            return {"sql": sql, "count": int(df.iloc[0]["n"])}
+        except Exception as e:
+            raise HTTPException(500, f"DEBUG ping error: {e}")
 
 @app.get("/tablas")
 def tablas():
@@ -255,6 +263,10 @@ def schema():
     return {"tabla": TABLA, "columns": df.to_dict(orient="records")}
 
 # ---------- consulta cliente (solo SUBTOTAL) ----------
+class TopItem(BaseModel):
+    nombre: str
+    valor: float
+
 @app.get("/consulta_cliente", response_model=ResumenCliente, dependencies=[Depends(require_auth)])
 def consulta_cliente(
     cliente: Optional[str] = Query(None, min_length=2, description="Nombre o parte del nombre"),
@@ -309,7 +321,7 @@ def consulta_cliente(
         where.append(f"lower([{grp_col}]) = lower(?)")
         params.append(grupo_inventario)
 
-    # Validación de existencia del ID en el periodo (sin mirar Subtotal)
+    # Validación existencia por identificación (independiente de Subtotal)
     if identificacion:
         with get_conn() as conn:
             exist_sql = f"""
@@ -323,16 +335,20 @@ def consulta_cliente(
             if exists.empty:
                 raise HTTPException(404, f"No se encontró la identificación enviada en el período: {ident_digits}.")
 
-    # SELECT principal con normalización numérica en SQL
+    # Consulta principal
     extra_where = " AND " + " AND ".join(where)
     base_sql, _ = build_base_select(val_col, extra_where=extra_where)
 
     with get_conn() as conn:
-        df = pd.read_sql(base_sql, conn, params=params)
+        try:
+            df = pd.read_sql(base_sql, conn, params=params)
+        except Exception as e:
+            raise HTTPException(500, f"Error SQL en consulta_cliente: {e}")
 
     if df.empty:
         raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
 
+    # Validación de Subtotal > 0
     if df["Subtotal"].fillna(0).sum() == 0:
         if identificacion:
             raise HTTPException(404, f"La identificación coincide, pero 'Subtotal' es 0/vacío en el período {desde} → {hasta}.")
@@ -355,6 +371,7 @@ def consulta_cliente(
     if cliente_det is not None:
         df = df[df["Cliente"] == cliente_det].copy()
 
+    # Seguridad extra (ya vienen normalizados)
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0.0)
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
 
@@ -373,7 +390,10 @@ def consulta_cliente(
           .rename(columns={"Subtotal": "valor"})
     )
     top_list = [
-        TopItem(nombre=("N/A" if pd.isna(r["Producto"]) else str(r["Producto"])), valor=float(r["valor"]))
+        TopItem(
+            nombre=("N/A" if pd.isna(r["Producto"]) else str(r["Producto"])),
+            valor=float(r["valor"])
+        )
         for _, r in top_prod_df.iterrows()
     ]
 
@@ -412,7 +432,7 @@ def informe_cliente(
             return {"informe": f"No encontré ventas para '{target}' en {desde} → {hasta}."}
         raise
 
-    lineas = ["🧾 Informe de cliente"]
+    lineas = [ "🧾 Informe de cliente" ]
     if r.cliente_id:
         lineas.append(f"Cliente: {r.cliente} (ID: {r.cliente_id})")
     else:
@@ -430,14 +450,17 @@ def informe_cliente(
     port = sorted(r.ventas_por_grupo.items(), key=lambda x: x[1], reverse=True)
     for k, v in port[:10]:
         lineas.append(f"  - {k}: ${v:,.2f}")
+
     lineas.append("")
     lineas.append("Top productos (Subtotal):")
     for i, tp in enumerate(r.top_productos[:10], 1):
         lineas.append(f"  {i}. {tp.nombre} — ${tp.valor:,.2f}")
+
     lineas.append("")
     lineas.append("Mensual (Subtotal):")
     for m, v in sorted(r.mensual_ventas.items()):
         lineas.append(f"  {m}: ${v:,.2f}")
+
     return {"informe": "\n".join(lineas)}
 
 # ---------- TOPS globales ----------
@@ -482,7 +505,10 @@ def tops(
     """
 
     with get_conn() as conn:
-        df = pd.read_sql(base_sql, conn, params=params)
+        try:
+            df = pd.read_sql(base_sql, conn, params=params)
+        except Exception as e:
+            raise HTTPException(500, f"Error SQL en tops: {e}")
 
     if df.empty:
         raise HTTPException(404, "No hay registros para el periodo/filtro indicado.")
