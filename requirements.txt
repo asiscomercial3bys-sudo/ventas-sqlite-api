@@ -6,6 +6,9 @@ python-dateutil==2.9.0.post0
 numpy==2.1.2
 requests==2.32.3
 gdown==5.1.0
+openai>=1.40.0
+httpx>=0.27.0
+
 
 
 
