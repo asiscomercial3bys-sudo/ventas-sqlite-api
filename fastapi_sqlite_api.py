@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.4.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.5.0")
 
 # CORS abierto (ajusta dominios si luego quieres limitar)
 app.add_middleware(
@@ -186,19 +186,47 @@ def extract_digits(s: str) -> str:
 
 def sql_number(col: str) -> str:
     """
-    Convierte texto monetario/numérico a float en SQLite:
-    - quita símbolos ($, espacios, #, *, paréntesis)
-    - maneja LATAM (1.234.567,89) y EN (1,234,567.89)
+    Normaliza texto monetario/numérico a FLOAT en SQLite.
+    Soporta formatos LATAM (1.234.567,89) y EN (1,234,567.89).
+    Solo usa funciones soportadas por SQLite.
     """
+    # Limpieza base (símbolos + controles comunes). char(10)=LF, char(13)=CR, char(9)=TAB.
     base = (
-        f"replace(replace(replace(replace(replace(replace(replace(replace(replace(replace("
-        f"replace([{col}], '$',''), ' ', ''), '#',''), '*',''), '(', ''), ')',''), '\\n',''), '\\t',''), ' ',''), chr(160), ''), '\u00A0','')"
+        "replace("
+            "replace("
+                "replace("
+                    "replace("
+                        "replace("
+                            "replace("
+                                "replace("
+                                    "replace("
+                                        "replace("
+                                            "replace("
+                                                "replace("
+                                                    f"[{col}], '$',''"
+                                                "), ' ', ''"
+                                            "), '#',''"
+                                        "), '*',''"
+                                    "), '(', ''"
+                                "), ')',''"
+                            f"), char(10), ''"
+                        f"), char(13), ''"
+                    f"), char(9), ''"
+                "), '-', ''"
+            "), '/', ''"
+        "), '+', ''"
     )
+
     latam = f"cast(replace(replace({base}, '.', ''), ',', '.') as float)"
-    enfmt = f"cast(replace({base}, ',', '') as float)"
     only_comma = f"cast(replace({base}, ',', '.') as float)"
-    return f"(case when instr({base}, ',')>0 and instr({base}, '.')>0 then {latam} " \
-           f"when instr({base}, ',')>0 and instr({base}, '.')=0 then {only_comma} else {enfmt} end)"
+    en = f"cast(replace({base}, ',', '') as float)"
+
+    return (
+        f"(case "
+        f"when instr({base}, ',')>0 and instr({base}, '.')>0 then {latam} "
+        f"when instr({base}, ',')>0 and instr({base}, '.')=0 then {only_comma} "
+        f"else {en} end)"
+    )
 
 # ---------- helpers SQL ----------
 def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
@@ -271,7 +299,7 @@ def consulta_cliente(
         if not id_col:
             raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
 
-        ident_digits = extract_digits(identificacion)
+        ident_digits = re.sub(r"\D+", "", str(identificacion))
         if not ident_digits:
             raise HTTPException(422, "Identificación inválida (no se encontraron dígitos).")
 
@@ -295,7 +323,7 @@ def consulta_cliente(
         where.append(f"lower([{grp_col}]) = lower(?)")
         params.append(grupo_inventario)
 
-    # 1) Si viniste por identificación, primero valida existencia de filas (independiente de Subtotal)
+    # Validar existencia del ID en el rango (independiente de Subtotal)
     if identificacion:
         with get_conn() as conn:
             exist_sql = f"""
@@ -309,7 +337,7 @@ def consulta_cliente(
             if exists.empty:
                 raise HTTPException(404, f"No se encontró la identificación enviada en el período: {ident_digits}.")
 
-    # 2) Consulta principal con Subtotal ya normalizado
+    # Consulta principal con Subtotal/Cantidad normalizados en SQL
     extra_where = " AND " + " AND ".join(where)
     base_sql, _ = build_base_select(val_col, extra_where=extra_where)
 
@@ -317,10 +345,8 @@ def consulta_cliente(
         df = pd.read_sql(base_sql, conn, params=params)
 
     if df.empty:
-        # Si llegamos aquí y está vacío, es porque los filtros adicionales (grupo, etc.) lo vaciaron
         raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
 
-    # Validación de Subtotal > 0 (ya llega como número real desde SQL)
     if df["Subtotal"].fillna(0).sum() == 0:
         if identificacion:
             raise HTTPException(404, f"La identificación coincide, pero 'Subtotal' es 0/vacío en el período {desde} → {hasta}.")
@@ -343,7 +369,7 @@ def consulta_cliente(
     if cliente_det is not None:
         df = df[df["Cliente"] == cliente_det].copy()
 
-    # Seguridad extra (ya vienen normalizados)
+    # Seguridad extra
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0.0)
     df["Subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce").fillna(0.0)
 
