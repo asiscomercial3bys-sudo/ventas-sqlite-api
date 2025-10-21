@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.2.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.3.0")
 
 # CORS abierto (ajusta dominios si luego quieres limitar)
 app.add_middleware(
@@ -70,7 +70,6 @@ def normalize(s: str) -> str:
 
 def strip_accents_spaces_lower(s: str) -> str:
     if s is None: return ""
-    import unicodedata
     s = unicodedata.normalize("NFKD", str(s))
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower().replace(" ", "")
 
@@ -103,24 +102,38 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Cliente (nombre)
     m["Cliente"] = (norm_map.get(normalize("Nombre cliente")) or
                     pick_fuzzy(norm_map, "nombre cliente", "cliente", "cliente/mes"))
-    # Identificación (puede venir con +Suc)
-    m["Identificacion"] = (norm_map.get(normalize("Identificación")) or
-                           norm_map.get(normalize("Identificacion")) or
-                           pick_fuzzy(norm_map, "identificacion+suc", "identificacion", "nit", "documento"))
+
+    # Identificación (ampliamos alias comunes)
+    m["Identificacion"] = (
+        norm_map.get(normalize("Identificación")) or
+        norm_map.get(normalize("Identificacion"))  or
+        pick_fuzzy(
+            norm_map,
+            "identificacion+suc", "identificacion", "nit", "nitcliente", "rut", "ruc",
+            "dni", "cedula", "cedulacliente", "doc", "documento", "numdocumento",
+            "idcliente", "clienteid", "nrodoc", "numero documento", "no documento"
+        )
+    )
+
     # Fecha
     m["Fecha"] = (norm_map.get(normalize("Fecha")) or
                   pick_fuzzy(norm_map, "fecha", "fechaventa", "date"))
+
     # Grupo de inventario / Portafolio
     m["GrupoInventario"] = (norm_map.get(normalize("Grupo inventario")) or
                             pick_fuzzy(norm_map, "grupoinventario", "grupo", "linea", "categoria"))
+
     # Portafolio (compat)
     m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
+
     # Producto
     m["Producto"] = (norm_map.get(normalize("Nombre producto")) or
                      pick_fuzzy(norm_map, "nombreproducto", "producto", "codigo", "codigoproducto"))
+
     # Cantidad
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
                      pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
+
     # Valores (SOLO Subtotal)
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
@@ -185,7 +198,7 @@ def ensure_period(desde: str, hasta: str):
         raise HTTPException(422, "El rango de fechas es inválido (desde > hasta).")
 
 def extract_digits(s: str) -> str:
-    return "".join(ch for ch in str(s) if ch.isdigit())
+    return re.sub(r"\D+", "", str(s))
 
 # ---------- endpoints básicos ----------
 @app.get("/health")
@@ -228,13 +241,23 @@ def consulta_cliente(
 
     if identificacion:
         if not id_col:
-            raise HTTPException(400, "No hay columna de Identificación en la base.")
+            raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
+
+        # 1) del parámetro: quedarnos solo con dígitos
         ident_digits = extract_digits(identificacion)
         if not ident_digits:
             raise HTTPException(422, "Identificación inválida (no se encontraron dígitos).")
-        where.append(f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE([{id_col}], '-', ''), '.', ''), ' ', ''), '/', ''), '+', '') LIKE ?")
+
+        # 2) del campo en la base: quitar TODO lo que no suma (., -, /, +, espacios, paréntesis, comas, _, #, *)
+        clean_sql = (
+            f"lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace("
+            f"replace([{id_col}], '-', ''), '.', ''), ' ', ''), '/', ''), '+', ''), ',', ''), '(', ''), ')', ''), '_', ''), '#', ''), '*', ''))"
+        )
+
+        where.append(f"{clean_sql} LIKE ?")
         params.append(f"%{ident_digits}%")
         filtro_det = f"Identificación ~ {ident_digits}"
+
     elif cliente:
         where.append(f"lower(REPLACE([{cli_col}], ' ', '')) LIKE ?")
         params.append(f"%{strip_accents_spaces_lower(cliente)}%")
