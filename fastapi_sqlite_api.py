@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.6.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.6.1")
 
 # CORS abierto
 app.add_middleware(
@@ -99,47 +99,54 @@ def map_columns(tbl: str) -> Dict[str,str]:
     norm_map = {normalize(c): c for c in names}
 
     m: Dict[str,str] = {}
+    # Cliente (nombre)
     m["Cliente"] = (norm_map.get(normalize("Nombre cliente")) or
                     pick_fuzzy(norm_map, "nombre cliente", "cliente", "cliente/mes"))
 
+    # Identificación
     m["Identificacion"] = (
         norm_map.get(normalize("Identificación")) or
         norm_map.get(normalize("Identificacion"))  or
         pick_fuzzy(
             norm_map,
-            "identificacion+suc","identificacion","nit","nitcliente","rut","ruc",
-            "dni","cedula","cedulacliente","doc","documento","numdocumento",
-            "idcliente","clienteid","nrodoc","numero documento","no documento"
+            "identificacion+suc", "identificacion", "nit", "nitcliente", "rut", "ruc",
+            "dni", "cedula", "cedulacliente", "doc", "documento", "numdocumento",
+            "idcliente", "clienteid", "nrodoc", "numero documento", "no documento"
         )
     )
 
+    # Fecha
     m["Fecha"] = (norm_map.get(normalize("Fecha")) or
                   pick_fuzzy(norm_map, "fecha", "fechaventa", "date"))
 
-    # Grupo de inventario
+    # Grupo de inventario / Portafolio
     m["GrupoInventario"] = (norm_map.get(normalize("Grupo inventario")) or
-                            pick_fuzzy(norm_map, "grupoinventario","grupo","linea","línea"))
-
-    # Categoria (nuevo mapeo explícito)
-    m["Categoria"] = (norm_map.get(normalize("Categoría")) or
-                      norm_map.get(normalize("Categoria")) or
-                      pick_fuzzy(norm_map, "categoria","categoría","segmento","familia","sublinea","sublinea","sublinea"))
+                            pick_fuzzy(norm_map, "grupoinventario", "grupo", "linea", "categoria", "portafolio"))
 
     # Portafolio (compat)
-    m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"] or m["Categoria"])
+    m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
 
+    # Categoria (mapea varios alias)
+    m["Categoria"] = (
+        norm_map.get(normalize("Categoria")) or
+        pick_fuzzy(norm_map, "categoria", "subcategoria", "familia", "rubro", "clase", "segmento")
+    )
+
+    # Producto
     m["Producto"] = (norm_map.get(normalize("Nombre producto")) or
-                     pick_fuzzy(norm_map, "nombreproducto","producto","codigo","codigoproducto"))
+                     pick_fuzzy(norm_map, "nombreproducto", "producto", "codigo", "codigoproducto"))
 
+    # Cantidad
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
-                     pick_fuzzy(norm_map, "cantidadvendida","cantidad","unidades","unid","cant","qty"))
+                     pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
 
+    # Subtotal (monto)
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
     if missing:
         raise HTTPException(400, f"Faltan columnas mínimas en [{tbl}]: {missing}. Revisa nombres.")
-    return m
+    return m   # <-- ARREGLADO: devolver el mapeo
 
 # ---------- modelos ----------
 class TopItem(BaseModel):
@@ -199,23 +206,12 @@ def parse_number_series(s: pd.Series) -> pd.Series:
 
 # --- Normalizaciones robustas para filtros de texto (SQL y Python) ---
 def sql_norm_column(col: str) -> str:
-    """
-    Devuelve una expresión SQL que normaliza la columna:
-    - lower()
-    - elimina espacios (incl. NBSP), signos comunes
-    - reemplaza acentos y ñ
-    - útil para comparar por igualdad o LIKE
-    """
     x = f"lower([{col}])"
-    # quitar NBSP (char(160)) y espacios normales
-    x = f"replace({x}, char(160), '')"
+    x = f"replace({x}, char(160), '')"  # NBSP
     x = f"replace({x}, ' ', '')"
-    # quitar signos comunes
     for ch in [".", ",", "-", "/", "+", "_", "(", ")", "'", '"']:
         x = f"replace({x}, '{ch}', '')"
-    # reemplazar acentos y ñ
-    repl = [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),("ñ","n")]
-    for a,b in repl:
+    for a,b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),("ñ","n")]:
         x = f"replace({x}, '{a}', '{b}')"
     return x
 
@@ -228,12 +224,9 @@ def py_norm_text(s: str) -> str:
     return s
 
 def add_text_filter(where: List[str], params: List[str], value: Optional[str], col: Optional[str]):
-    """
-    Aplica filtro robusto (igualdad o LIKE parcial) sobre 'col' usando normalización SQL y Python.
-    """
     if value and col:
-        norm_col = sql_norm_column(col)   # columna normalizada en SQL
-        norm_val = py_norm_text(value)    # valor normalizado en Python
+        norm_col = sql_norm_column(col)
+        norm_val = py_norm_text(value)
         where.append(f"({norm_col} = ? OR {norm_col} LIKE ?)")
         params.extend([norm_val, f"%{norm_val}%"])
 
@@ -251,14 +244,11 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
         f"[{qty_col}]  AS Cantidad",
         f"[{val_col}]  AS Subtotal",
     ]
-    # Insertar dimensiones opcionales en posición 2 y 3
     insert_pos = 2
     if grp_col:
-        sel.insert(insert_pos, f"[{grp_col}] AS GrupoInventario")
-        insert_pos += 1
+        sel.insert(insert_pos, f"[{grp_col}] AS GrupoInventario"); insert_pos += 1
     else:
-        sel.insert(insert_pos, "'N/A' AS GrupoInventario")
-        insert_pos += 1
+        sel.insert(insert_pos, "'N/A' AS GrupoInventario"); insert_pos += 1
     if cat_col:
         sel.insert(insert_pos, f"[{cat_col}] AS Categoria")
     else:
@@ -311,10 +301,11 @@ def consulta_cliente(
     where = ["date([" + fec_col + "]) BETWEEN ? AND ?"]
     params: List = [desde, hasta]
 
-    filtro_det = ""
+    filtro_det = []
     cliente_det = None
     cliente_id_det = None
 
+    # Filtro por identificación
     if identificacion:
         if not id_col:
             raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
@@ -327,32 +318,43 @@ def consulta_cliente(
         )
         where.append(f"{clean_sql} LIKE ?")
         params.append(f"%{ident_digits}%")
-        filtro_det = f"Identificación ~ {ident_digits}"
-
+        filtro_det.append(f"Identificación~{ident_digits}")
     elif cliente:
         where.append(f"lower(REPLACE([{cli_col}], ' ', '')) LIKE ?")
         params.append(f"%{strip_accents_spaces_lower(cliente)}%")
-        filtro_det = f"Cliente ~ {cliente}"
+        filtro_det.append(f"Cliente~{cliente}")
     else:
         raise HTTPException(422, "Debes enviar 'cliente' o 'identificacion'.")
 
-    # Filtro robusto por GrupoInventario y/o Categoria (AND si vienen ambos)
-    add_text_filter(where, params, grupo_inventario, grp_col)
-    add_text_filter(where, params, categoria,        cat_col)
+    # Filtro por grupo
+    if grupo_inventario and grp_col:
+        where.append(f"lower(REPLACE([{grp_col}], ' ', '')) = ?")
+        params.append(strip_accents_spaces_lower(grupo_inventario))
+        filtro_det.append(f"Grupo={grupo_inventario}")
+
+    # Filtro por categoría
+    if categoria:
+        if not cat_col:
+            raise HTTPException(400, "No existe columna de Categoría en la base.")
+        where.append(f"lower(REPLACE([{cat_col}], ' ', '')) = ?")
+        params.append(strip_accents_spaces_lower(categoria))
+        filtro_det.append(f"Categoria={categoria}")
 
     extra_where = " AND " + " AND ".join(where)
     base_sql, _ = build_base_select(val_col, extra_where=extra_where)
 
-    with get_conn() as conn:
-        df = pd.read_sql(base_sql, conn, params=params)
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql(base_sql, conn, params=params)
+    except Exception as e:
+        raise HTTPException(400, f"Consulta inválida ({' & '.join(filtro_det)}): {e}")
 
     if df.empty:
-        raise HTTPException(404, f"Sin datos para ese filtro ({filtro_det}) en {desde} → {hasta}.")
+        raise HTTPException(404, f"Sin datos para ese filtro ({' & '.join(filtro_det)}) en {desde} → {hasta}.")
 
-    # Normalización numérica robusta
+    # Normalización de números
     df["Cantidad"] = parse_number_series(df["Cantidad"])
     df["Subtotal"] = parse_number_series(df["Subtotal"])
-
     if df["Subtotal"].sum() == 0:
         raise HTTPException(404, "No hay registros con valores en el campo 'Subtotal' para este filtro.")
 
@@ -361,7 +363,7 @@ def consulta_cliente(
         with get_conn() as conn:
             df_id = pd.read_sql(
                 f"SELECT [{id_col}] AS Ident, [{cli_col}] AS Cliente FROM [{TABLA}] "
-                f"WHERE date([{COLS['Fecha']}]) BETWEEN ? AND ?",
+                f"WHERE date([{fec_col}]) BETWEEN ? AND ?",
                 conn, params=[desde, hasta]
             )
         if not df_id.empty:
@@ -377,13 +379,11 @@ def consulta_cliente(
     total_valor    = float(df["Subtotal"].sum())
     ticket_prom    = float(total_valor / total_unidades) if total_unidades else 0.0
 
-    # Por grupo (mantenemos la salida existente)
     por_grupo = (
         df.groupby("GrupoInventario", dropna=False)["Subtotal"]
           .sum().sort_values(ascending=False).round(2).to_dict()
     )
 
-    # Top productos del cliente
     top_prod_df = (
         df.groupby("Producto", dropna=False)["Subtotal"]
           .sum().sort_values(ascending=False).head(10).reset_index()
@@ -520,7 +520,6 @@ def tops(
     if df.empty:
         raise HTTPException(404, "No hay registros para el periodo/filtro indicado.")
 
-    # Normalizar números en Python
     df["Subtotal"] = parse_number_series(df["Subtotal"])
 
     if df["Subtotal"].sum() == 0:
