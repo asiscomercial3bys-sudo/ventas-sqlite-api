@@ -474,3 +474,4 @@ def tops(
         desde=desde, hasta=hasta, grupo_inventario=grupo_inventario,
         top=resultado
     )
+
