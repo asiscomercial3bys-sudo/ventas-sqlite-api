@@ -1,3 +1,6 @@
+# fastapi_sqlite_api.py
+# =====================
+
 # ---------- imports ----------
 from pathlib import Path
 import sqlite3, re, unicodedata, os
@@ -38,7 +41,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.6.1")
+app = FastAPI(title="Ventas API (SQLite)", version="2.6.2")
 
 # CORS abierto
 app.add_middleware(
@@ -146,7 +149,7 @@ def map_columns(tbl: str) -> Dict[str,str]:
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
     if missing:
         raise HTTPException(400, f"Faltan columnas mínimas en [{tbl}]: {missing}. Revisa nombres.")
-    return m   # <-- ARREGLADO: devolver el mapeo
+    return m
 
 # ---------- modelos ----------
 class TopItem(BaseModel):
@@ -490,11 +493,13 @@ def tops(
     if not val_col:
         raise HTTPException(500, "No existe columna Subtotal en la base.")
 
-    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
+    pro_col = COLS["Producto"]
     grp_col = COLS.get("GrupoInventario")
     cat_col = COLS.get("Categoria")
-    pro_col = COLS["Producto"]
 
+    # WHERE + parámetros
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
     params: List = [desde, hasta]
 
@@ -502,14 +507,21 @@ def tops(
     add_text_filter(where, params, grupo_inventario, grp_col)
     add_text_filter(where, params, categoria,        cat_col)
 
+    # Columna objetivo
     target_col = f"[{cli_col}]" if entidad == "clientes" else f"[{pro_col}]"
+
+    # (AJUSTE) columnas opcionales sin comas extra
+    cols_extra = []
+    if grp_col:
+        cols_extra.append(f"[{grp_col}] AS GrupoInventario")
+    if cat_col:
+        cols_extra.append(f"[{cat_col}] AS Categoria")
+    cols_sql = (", " + ", ".join(cols_extra)) if cols_extra else ""
 
     base_sql = f"""
         SELECT {target_col} AS Nombre,
-               [{val_col}]  AS Subtotal,
-               [{fec_col}]  AS Fecha
-               {"," + f"[{grp_col}] AS GrupoInventario" if grp_col else ""}
-               {"," + f"[{cat_col}] AS Categoria" if cat_col else ""}
+               [{val_col}] AS Subtotal,
+               [{fec_col}] AS Fecha{cols_sql}
         FROM [{TABLA}]
         WHERE {" AND ".join(where)}
     """
@@ -520,26 +532,34 @@ def tops(
     if df.empty:
         raise HTTPException(404, "No hay registros para el periodo/filtro indicado.")
 
+    # Normalizar números
     df["Subtotal"] = parse_number_series(df["Subtotal"])
-
     if df["Subtotal"].sum() == 0:
         raise HTTPException(404, "No hay valores en 'Subtotal' para el periodo/filtro indicado.")
 
     df["Nombre"] = df["Nombre"].fillna("N/A")
 
+    # Agregación mensual o anual
     if frecuencia == "mensual":
         df["Periodo"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m")
-        g = df.groupby(["Periodo","Nombre"], dropna=False)["Subtotal"].sum().reset_index()
+        g = df.groupby(["Periodo", "Nombre"], dropna=False)["Subtotal"].sum().reset_index()
         resultado: List[Dict[str, object]] = []
         for periodo, chunk in g.groupby("Periodo"):
             chunk = chunk.sort_values("Subtotal", ascending=(orden == "menos"))
             head = chunk.head(limite)
             for _, r in head.iterrows():
-                resultado.append({"periodo": periodo, "nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))})
+                resultado.append({
+                    "periodo": periodo,
+                    "nombre": str(r["Nombre"]),
+                    "valor": float(round(r["Subtotal"], 2))
+                })
     else:
         g = df.groupby("Nombre", dropna=False)["Subtotal"].sum().reset_index()
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
-        resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
+        resultado = [
+            {"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"], 2))}
+            for _, r in g.iterrows()
+        ]
 
     return TopRespuesta(
         entidad=entidad, orden=orden, frecuencia=frecuencia,
