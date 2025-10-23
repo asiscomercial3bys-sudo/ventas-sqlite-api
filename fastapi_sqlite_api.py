@@ -41,7 +41,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.6.2")
+app = FastAPI(title="Ventas API (SQLite)", version="2.7.0")
 
 # CORS abierto
 app.add_middleware(
@@ -56,7 +56,6 @@ app.add_middleware(
 def get_conn():
     if not DB_PATH.exists():
         raise HTTPException(500, f"No existe la base en {DB_PATH}")
-    # Evitar bloqueos con Uvicorn
     return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
 def list_tables() -> List[str]:
@@ -102,48 +101,31 @@ def map_columns(tbl: str) -> Dict[str,str]:
     norm_map = {normalize(c): c for c in names}
 
     m: Dict[str,str] = {}
-    # Cliente (nombre)
     m["Cliente"] = (norm_map.get(normalize("Nombre cliente")) or
                     pick_fuzzy(norm_map, "nombre cliente", "cliente", "cliente/mes"))
-
-    # Identificación
     m["Identificacion"] = (
         norm_map.get(normalize("Identificación")) or
         norm_map.get(normalize("Identificacion"))  or
         pick_fuzzy(
             norm_map,
-            "identificacion+suc", "identificacion", "nit", "nitcliente", "rut", "ruc",
-            "dni", "cedula", "cedulacliente", "doc", "documento", "numdocumento",
-            "idcliente", "clienteid", "nrodoc", "numero documento", "no documento"
+            "identificacion+suc","identificacion","nit","nitcliente","rut","ruc",
+            "dni","cedula","cedulacliente","doc","documento","numdocumento",
+            "idcliente","clienteid","nrodoc","numero documento","no documento"
         )
     )
-
-    # Fecha
     m["Fecha"] = (norm_map.get(normalize("Fecha")) or
                   pick_fuzzy(norm_map, "fecha", "fechaventa", "date"))
-
-    # Grupo de inventario / Portafolio
     m["GrupoInventario"] = (norm_map.get(normalize("Grupo inventario")) or
-                            pick_fuzzy(norm_map, "grupoinventario", "grupo", "linea", "categoria", "portafolio"))
-
-    # Portafolio (compat)
+                            pick_fuzzy(norm_map, "grupoinventario","grupo","linea","categoria","portafolio"))
     m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
-
-    # Categoria (mapea varios alias)
     m["Categoria"] = (
         norm_map.get(normalize("Categoria")) or
-        pick_fuzzy(norm_map, "categoria", "subcategoria", "familia", "rubro", "clase", "segmento")
+        pick_fuzzy(norm_map, "categoria","subcategoria","familia","rubro","clase","segmento")
     )
-
-    # Producto
     m["Producto"] = (norm_map.get(normalize("Nombre producto")) or
-                     pick_fuzzy(norm_map, "nombreproducto", "producto", "codigo", "codigoproducto"))
-
-    # Cantidad
+                     pick_fuzzy(norm_map, "nombreproducto","producto","codigo","codigoproducto"))
     m["Cantidad"] = (norm_map.get(normalize("Cantidad vendida")) or
-                     pick_fuzzy(norm_map, "cantidadvendida", "cantidad", "unidades", "unid", "cant", "qty"))
-
-    # Subtotal (monto)
+                     pick_fuzzy(norm_map, "cantidadvendida","cantidad","unidades","unid","cant","qty"))
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
     missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
@@ -170,7 +152,7 @@ class ResumenCliente(BaseModel):
     mensual_unidades: Dict[str, float]
 
 class TopRespuesta(BaseModel):
-    entidad: Literal["clientes","productos"]
+    entidad: Literal["clientes","productos","grupos","categorias"]
     orden: Literal["mas","menos"]
     frecuencia: Literal["mensual","anual"]
     desde: str
@@ -237,8 +219,7 @@ def add_text_filter(where: List[str], params: List[str], value: Optional[str], c
 def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
     cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
     pro_col = COLS["Producto"]; grp_col = COLS.get("GrupoInventario")
-    cat_col = COLS.get("Categoria")
-    qty_col = COLS["Cantidad"]
+    cat_col = COLS.get("Categoria"); qty_col = COLS["Cantidad"]
 
     sel = [
         f"[{cli_col}]  AS Cliente",
@@ -281,6 +262,21 @@ def schema():
         df = pd.read_sql(f"PRAGMA table_info([{TABLA}])", conn)
     return {"tabla": TABLA, "columns": df.to_dict(orient="records")}
 
+@app.get("/dimensiones", dependencies=[Depends(require_auth)])
+def dimensiones():
+    """Devuelve los valores únicos (limpios) de GrupoInventario y Categoria para autocompletar."""
+    grp_col = COLS.get("GrupoInventario")
+    cat_col = COLS.get("Categoria")
+    res = {"grupos": [], "categorias": []}
+    with get_conn() as conn:
+        if grp_col:
+            g = pd.read_sql(f"SELECT [{grp_col}] AS v FROM [{TABLA}] WHERE [{grp_col}] IS NOT NULL", conn)
+            res["grupos"] = sorted({str(x).strip() for x in g["v"] if pd.notna(x) and str(x).strip()})
+        if cat_col:
+            c = pd.read_sql(f"SELECT [{cat_col}] AS v FROM [{TABLA}] WHERE [{cat_col}] IS NOT NULL", conn)
+            res["categorias"] = sorted({str(x).strip() for x in c["v"] if pd.notna(x) and str(x).strip()})
+    return res
+
 # ---------- consulta cliente (solo SUBTOTAL) ----------
 @app.get("/consulta_cliente", response_model=ResumenCliente, dependencies=[Depends(require_auth)])
 def consulta_cliente(
@@ -297,8 +293,7 @@ def consulta_cliente(
         raise HTTPException(500, "No existe columna Subtotal en la base. Corrige la estructura.")
 
     cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
-    grp_col = COLS.get("GrupoInventario")
-    cat_col = COLS.get("Categoria")
+    grp_col = COLS.get("GrupoInventario"); cat_col = COLS.get("Categoria")
     id_col  = COLS.get("Identificacion")
 
     where = ["date([" + fec_col + "]) BETWEEN ? AND ?"]
@@ -308,7 +303,7 @@ def consulta_cliente(
     cliente_det = None
     cliente_id_det = None
 
-    # Filtro por identificación
+    # Identificación o Cliente (obligatorio uno)
     if identificacion:
         if not id_col:
             raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
@@ -329,13 +324,11 @@ def consulta_cliente(
     else:
         raise HTTPException(422, "Debes enviar 'cliente' o 'identificacion'.")
 
-    # Filtro por grupo
+    # Filtros por Grupo / Categoría
     if grupo_inventario and grp_col:
         where.append(f"lower(REPLACE([{grp_col}], ' ', '')) = ?")
         params.append(strip_accents_spaces_lower(grupo_inventario))
         filtro_det.append(f"Grupo={grupo_inventario}")
-
-    # Filtro por categoría
     if categoria:
         if not cat_col:
             raise HTTPException(400, "No existe columna de Categoría en la base.")
@@ -361,7 +354,7 @@ def consulta_cliente(
     if df["Subtotal"].sum() == 0:
         raise HTTPException(404, "No hay registros con valores en el campo 'Subtotal' para este filtro.")
 
-    # Resolver homónimos y set de cliente/ID
+    # Resolver homónimos
     if identificacion and id_col:
         with get_conn() as conn:
             df_id = pd.read_sql(
@@ -479,7 +472,7 @@ def informe_cliente(
 # ---------- TOPS globales ----------
 @app.get("/tops", response_model=TopRespuesta, dependencies=[Depends(require_auth)])
 def tops(
-    entidad: Literal["clientes","productos"] = Query(..., description="Entidad objetivo del top"),
+    entidad: Literal["clientes","productos","grupos","categorias"] = Query(..., description="Entidad objetivo del top"),
     orden: Literal["mas","menos"] = Query("mas", description="‘mas’ o ‘menos’"),
     frecuencia: Literal["mensual","anual"] = Query("anual"),
     desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
@@ -493,11 +486,8 @@ def tops(
     if not val_col:
         raise HTTPException(500, "No existe columna Subtotal en la base.")
 
-    cli_col = COLS["Cliente"]
-    fec_col = COLS["Fecha"]
-    pro_col = COLS["Producto"]
-    grp_col = COLS.get("GrupoInventario")
-    cat_col = COLS.get("Categoria")
+    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]; pro_col = COLS["Producto"]
+    grp_col = COLS.get("GrupoInventario"); cat_col = COLS.get("Categoria")
 
     # WHERE + parámetros
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
@@ -507,10 +497,17 @@ def tops(
     add_text_filter(where, params, grupo_inventario, grp_col)
     add_text_filter(where, params, categoria,        cat_col)
 
-    # Columna objetivo
-    target_col = f"[{cli_col}]" if entidad == "clientes" else f"[{pro_col}]"
+    # Selección de la "Nombre" según entidad
+    if entidad == "clientes":
+        nombre_sel = f"[{cli_col}] AS Nombre"
+    elif entidad == "productos":
+        nombre_sel = f"[{pro_col}] AS Nombre"
+    elif entidad == "grupos":
+        nombre_sel = f"[{grp_col}] AS Nombre" if grp_col else "'N/A' AS Nombre"
+    else:  # categorias
+        nombre_sel = f"[{cat_col}] AS Nombre" if cat_col else "'N/A' AS Nombre"
 
-    # (AJUSTE) columnas opcionales sin comas extra
+    # columnas extras (solo para referencia)
     cols_extra = []
     if grp_col:
         cols_extra.append(f"[{grp_col}] AS GrupoInventario")
@@ -519,7 +516,7 @@ def tops(
     cols_sql = (", " + ", ".join(cols_extra)) if cols_extra else ""
 
     base_sql = f"""
-        SELECT {target_col} AS Nombre,
+        SELECT {nombre_sel},
                [{val_col}] AS Subtotal,
                [{fec_col}] AS Fecha{cols_sql}
         FROM [{TABLA}]
@@ -539,27 +536,19 @@ def tops(
 
     df["Nombre"] = df["Nombre"].fillna("N/A")
 
-    # Agregación mensual o anual
+    # Agregación
     if frecuencia == "mensual":
         df["Periodo"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m")
         g = df.groupby(["Periodo", "Nombre"], dropna=False)["Subtotal"].sum().reset_index()
         resultado: List[Dict[str, object]] = []
         for periodo, chunk in g.groupby("Periodo"):
             chunk = chunk.sort_values("Subtotal", ascending=(orden == "menos"))
-            head = chunk.head(limite)
-            for _, r in head.iterrows():
-                resultado.append({
-                    "periodo": periodo,
-                    "nombre": str(r["Nombre"]),
-                    "valor": float(round(r["Subtotal"], 2))
-                })
+            for _, r in chunk.head(limite).iterrows():
+                resultado.append({"periodo": str(periodo), "nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))})
     else:
         g = df.groupby("Nombre", dropna=False)["Subtotal"].sum().reset_index()
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
-        resultado = [
-            {"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"], 2))}
-            for _, r in g.iterrows()
-        ]
+        resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
 
     return TopRespuesta(
         entidad=entidad, orden=orden, frecuencia=frecuencia,
