@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.8.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.8.1")
 
 # CORS abierto
 app.add_middleware(
@@ -126,7 +126,7 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Portafolio (compat)
     m["Portafolio"] = (norm_map.get(normalize("Portafolio")) or m["GrupoInventario"])
 
-    # Categoria (mapea varios alias)
+    # Categoria
     m["Categoria"] = (
         norm_map.get(normalize("Categoria")) or
         pick_fuzzy(norm_map, "categoria", "subcategoria", "familia", "rubro", "clase", "segmento")
@@ -179,7 +179,7 @@ def parse_number_series(s: pd.Series) -> pd.Series:
     x2 = pd.concat([x_latam, x_onlyc, x_rest]).reindex(x.index)
     return pd.to_numeric(x2, errors="coerce").fillna(0.0)
 
-# --- Normalizaciones robustas para filtros de texto (SQL y Python) ---
+# --- Normalizaciones (no usadas en las series simples, pero útiles en otros endpoints) ---
 def sql_norm_column(col: str) -> str:
     x = f"lower([{col}])"
     x = f"replace({x}, char(160), '')"  # NBSP
@@ -551,7 +551,7 @@ def tops(
         top=resultado
     )
 
-# ---------- Series (MENSUAL / ANUAL) sin vistas ----------
+# ---------- Series (MENSUAL / ANUAL) LIMPIAS ----------
 def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tuple[str,str]:
     """
     Si no envían desde/hasta, usa todo el rango disponible en la base (por fecha).
@@ -582,9 +582,14 @@ def _build_sales_df(desde: str, hasta: str,
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
     params: List[str] = [desde, hasta]
 
-    add_text_filter(where, params, grupo_inventario, grp_col)
-    add_text_filter(where, params, categoria,        cat_col)
-    add_text_filter(where, params, producto,         pro_col)
+    # Filtros simples y robustos (lower + sin espacios)
+    def add_like(value: Optional[str], col: Optional[str]):
+        if value and col:
+            where.append(f"lower(replace([{col}], ' ', '')) LIKE ?")
+            params.append(f"%{strip_accents_spaces_lower(value)}%")
+    add_like(grupo_inventario, grp_col)
+    add_like(categoria,        cat_col)
+    add_like(producto,         pro_col)
 
     sql = f"""
       SELECT [{fec_col}] AS Fecha,
@@ -614,56 +619,51 @@ def _build_sales_df(desde: str, hasta: str,
 
 @app.get("/ventas_mensuales_vista", dependencies=[Depends(require_auth)])
 def ventas_mensuales_vista(
-    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
-    grupo_inventario: Optional[str] = Query(None, description="Filtro por grupo inventario (flexible)"),
-    categoria:        Optional[str] = Query(None, description="Filtro por categoría (flexible)"),
-    producto:         Optional[str] = Query(None, description="Filtro por producto (flexible)"),
-    top_n:            Optional[int] = Query(None, ge=1, le=100, description="Opcional: devolver solo top N meses por monto")
+    desde: Optional[str] = Query(None),
+    hasta: Optional[str] = Query(None),
+    grupo_inventario: Optional[str] = Query(None),
+    categoria: Optional[str] = Query(None),
+    producto: Optional[str] = Query(None)
 ):
-    d,h = _ensure_period_or_default(desde, hasta)
+    """
+    Devuelve ventas mensuales filtradas por grupo, categoría o producto.
+    """
+    d, h = _ensure_period_or_default(desde, hasta)
     ensure_period(d, h)
 
     df = _build_sales_df(d, h, grupo_inventario, categoria, producto)
-    df["YYYYMM"] = df["Fecha"].dt.strftime("%Y-%m")
-    mens = df.groupby("YYYYMM", dropna=False)["Subtotal"].sum().sort_index()
-
-    if top_n:
-        mens = mens.sort_values(ascending=False).head(top_n).sort_index()
+    df["Mes"] = df["Fecha"].dt.strftime("%Y-%m")
+    mens = df.groupby("Mes", dropna=False)["Subtotal"].sum().sort_index()
 
     return {
         "ok": True,
-        "filtros": {
-            "desde": d, "hasta": h,
-            "grupo_inventario": grupo_inventario,
-            "categoria": categoria,
-            "producto": producto
-        },
-        "series_mensuales": {k: float(v) for k,v in mens.round(2).items()}
+        "filtros": {"desde": d, "hasta": h,
+                    "grupo_inventario": grupo_inventario,
+                    "categoria": categoria,
+                    "producto": producto},
+        "ventas_mensuales": [{"Mes": k, "Total": float(round(v,2))} for k, v in mens.items()]
     }
 
 @app.get("/ventas_anuales_vista", dependencies=[Depends(require_auth)])
 def ventas_anuales_vista(
-    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    desde: Optional[str] = Query(None),
+    hasta: Optional[str] = Query(None),
     grupo_inventario: Optional[str] = Query(None),
     categoria:        Optional[str] = Query(None),
     producto:         Optional[str] = Query(None)
 ):
-    d,h = _ensure_period_or_default(desde, hasta)
+    d, h = _ensure_period_or_default(desde, hasta)
     ensure_period(d, h)
 
     df = _build_sales_df(d, h, grupo_inventario, categoria, producto)
-    df["YYYY"] = df["Fecha"].dt.year.astype(str)
-    anual = df.groupby("YYYY", dropna=False)["Subtotal"].sum().sort_index()
+    df["Anio"] = df["Fecha"].dt.year.astype(str)
+    anual = df.groupby("Anio", dropna=False)["Subtotal"].sum().sort_index()
 
     return {
         "ok": True,
-        "filtros": {
-            "desde": d, "hasta": h,
-            "grupo_inventario": grupo_inventario,
-            "categoria": categoria,
-            "producto": producto
-        },
-        "series_anuales": {k: float(v) for k,v in anual.round(2).items()}
+        "filtros": {"desde": d, "hasta": h,
+                    "grupo_inventario": grupo_inventario,
+                    "categoria": categoria,
+                    "producto": producto},
+        "ventas_anuales": [{"Anio": k, "Total": float(round(v,2))} for k, v in anual.items()]
     }
