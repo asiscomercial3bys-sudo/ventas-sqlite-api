@@ -667,3 +667,67 @@ def ventas_anuales_vista(
                     "producto": producto},
         "ventas_anuales": [{"Anio": k, "Total": float(round(v,2))} for k, v in anual.items()]
     }
+# --------- ALIAS explícitos para que coincidan con el esquema ----------
+
+# MENSUALES
+@app.get("/ventas_mensuales_por_grupo", dependencies=[Depends(require_auth)])
+def ventas_mensuales_por_grupo(
+    grupo_inventario: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_mensuales_vista(desde=desde, hasta=hasta,
+                                  grupo_inventario=grupo_inventario,
+                                  categoria=None, producto=None)
+
+@app.get("/ventas_mensuales_por_categoria", dependencies=[Depends(require_auth)])
+def ventas_mensuales_por_categoria(
+    categoria: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_mensuales_vista(desde=desde, hasta=hasta,
+                                  grupo_inventario=None,
+                                  categoria=categoria, producto=None)
+
+@app.get("/ventas_mensuales_por_producto", dependencies=[Depends(require_auth)])
+def ventas_mensuales_por_producto(
+    producto: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_mensuales_vista(desde=desde, hasta=hasta,
+                                  grupo_inventario=None,
+                                  categoria=None, producto=producto)
+
+# ANUALES
+@app.get("/ventas_anuales_por_grupo", dependencies=[Depends(require_auth)])
+def ventas_anuales_por_grupo(
+    grupo_inventario: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_anuales_vista(desde=desde, hasta=hasta,
+                                grupo_inventario=grupo_inventario,
+                                categoria=None, producto=None)
+
+@app.get("/ventas_anuales_por_categoria", dependencies=[Depends(require_auth)])
+def ventas_anuales_por_categoria(
+    categoria: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_anuales_vista(desde=desde, hasta=hasta,
+                                grupo_inventario=None,
+                                categoria=categoria, producto=None)
+
+@app.get("/ventas_anuales_por_producto", dependencies=[Depends(require_auth)])
+def ventas_anuales_por_producto(
+    producto: str = Query(...),
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    return ventas_anuales_vista(desde=desde, hasta=hasta,
+                                grupo_inventario=None,
+                                categoria=None, producto=producto)
+
