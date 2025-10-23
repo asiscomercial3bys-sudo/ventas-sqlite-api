@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.8.1")
+app = FastAPI(title="Ventas API (SQLite)", version="2.9.0")
 
 # CORS abierto
 app.add_middleware(
@@ -179,8 +179,11 @@ def parse_number_series(s: pd.Series) -> pd.Series:
     x2 = pd.concat([x_latam, x_onlyc, x_rest]).reindex(x.index)
     return pd.to_numeric(x2, errors="coerce").fillna(0.0)
 
-# --- Normalizaciones (no usadas en las series simples, pero útiles en otros endpoints) ---
+# --- Normalizaciones robustas para filtros de texto (SQL y Python) ---
 def sql_norm_column(col: str) -> str:
+    """
+    Normaliza una columna en SQL: minúsculas, sin espacios, signos ni acentos (LATAM).
+    """
     x = f"lower([{col}])"
     x = f"replace({x}, char(160), '')"  # NBSP
     x = f"replace({x}, ' ', '')"
@@ -308,7 +311,6 @@ def consulta_cliente(
     cliente_det = None
     cliente_id_det = None
 
-    # Filtro por identificación
     if identificacion:
         if not id_col:
             raise HTTPException(400, "No hay columna de Identificación en la base (ver /schema).")
@@ -329,13 +331,11 @@ def consulta_cliente(
     else:
         raise HTTPException(422, "Debes enviar 'cliente' o 'identificacion'.")
 
-    # Filtro por grupo
     if grupo_inventario and grp_col:
         where.append(f"lower(REPLACE([{grp_col}], ' ', '')) = ?")
         params.append(strip_accents_spaces_lower(grupo_inventario))
         filtro_det.append(f"Grupo={grupo_inventario}")
 
-    # Filtro por categoría
     if categoria:
         if not cat_col:
             raise HTTPException(400, "No existe columna de Categoría en la base.")
@@ -582,11 +582,14 @@ def _build_sales_df(desde: str, hasta: str,
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
     params: List[str] = [desde, hasta]
 
-    # Filtros simples y robustos (lower + sin espacios)
+    # --- FIX CLAVE: normalizamos COLUMNA y VALOR de forma consistente ---
     def add_like(value: Optional[str], col: Optional[str]):
         if value and col:
-            where.append(f"lower(replace([{col}], ' ', '')) LIKE ?")
-            params.append(f"%{strip_accents_spaces_lower(value)}%")
+            norm_col = sql_norm_column(col)
+            norm_val = py_norm_text(value)
+            where.append(f"{norm_col} LIKE ?")
+            params.append(f"%{norm_val}%")
+
     add_like(grupo_inventario, grp_col)
     add_like(categoria,        cat_col)
     add_like(producto,         pro_col)
@@ -625,9 +628,6 @@ def ventas_mensuales_vista(
     categoria: Optional[str] = Query(None),
     producto: Optional[str] = Query(None)
 ):
-    """
-    Devuelve ventas mensuales filtradas por grupo, categoría o producto.
-    """
     d, h = _ensure_period_or_default(desde, hasta)
     ensure_period(d, h)
 
@@ -667,9 +667,8 @@ def ventas_anuales_vista(
                     "producto": producto},
         "ventas_anuales": [{"Anio": k, "Total": float(round(v,2))} for k, v in anual.items()]
     }
-# --------- ALIAS explícitos para que coincidan con el esquema ----------
 
-# MENSUALES
+# --------- ALIAS explícitos (útiles para Actions) ----------
 @app.get("/ventas_mensuales_por_grupo", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_grupo(
     grupo_inventario: str = Query(...),
@@ -700,7 +699,6 @@ def ventas_mensuales_por_producto(
                                   grupo_inventario=None,
                                   categoria=None, producto=producto)
 
-# ANUALES
 @app.get("/ventas_anuales_por_grupo", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_grupo(
     grupo_inventario: str = Query(...),
@@ -731,3 +729,45 @@ def ventas_anuales_por_producto(
                                 grupo_inventario=None,
                                 categoria=None, producto=producto)
 
+# ---------- Descubrimiento de valores (para evitar "nombre exacto") ----------
+def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
+    with get_conn() as conn:
+        where = f"WHERE [{col_real}] IS NOT NULL"
+        params: List[str] = []
+        if contiene:
+            norm_col = sql_norm_column(col_real)
+            norm_val = py_norm_text(contiene)
+            where += f" AND {norm_col} LIKE ?"
+            params.append(f"%{norm_val}%")
+        sql = f"""
+            SELECT [{col_real}] AS valor, COUNT(*) AS conteo
+            FROM [{TABLA}]
+            {where}
+            GROUP BY [{col_real}]
+            ORDER BY conteo DESC
+            LIMIT ?
+        """
+        params.append(int(limite))
+        df = pd.read_sql(sql, conn, params=params)
+    return {"items": df.to_dict(orient="records")}
+
+@app.get("/valores/grupos", dependencies=[Depends(require_auth)])
+def valores_grupos(contiene: Optional[str] = None, limite: int = 200):
+    col = COLS.get("GrupoInventario")
+    if not col:
+        raise HTTPException(400, "No existe columna de GrupoInventario en la base.")
+    return _listar_unicos(col, contiene, limite)
+
+@app.get("/valores/categorias", dependencies=[Depends(require_auth)])
+def valores_categorias(contiene: Optional[str] = None, limite: int = 200):
+    col = COLS.get("Categoria")
+    if not col:
+        raise HTTPException(400, "No existe columna de Categoría en la base.")
+    return _listar_unicos(col, contiene, limite)
+
+@app.get("/valores/productos", dependencies=[Depends(require_auth)])
+def valores_productos(contiene: Optional[str] = None, limite: int = 200):
+    col = COLS.get("Producto")
+    if not col:
+        raise HTTPException(400, "No existe columna de Producto en la base.")
+    return _listar_unicos(col, contiene, limite)
