@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.9.0")
+app = FastAPI(title="Ventas API (SQLite)", version="3.0.0")
 
 # CORS abierto
 app.add_middleware(
@@ -197,7 +197,7 @@ def py_norm_text(s: str) -> str:
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
     s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[.,\-\/\+_()'\"“”’]", "", s)
+    s = re.sub(r"[.,\\-\\/\\+_()'\"“”’]", "", s)
     s = s.replace("\u00A0","")
     return s
 
@@ -265,7 +265,18 @@ class TopRespuesta(BaseModel):
     categoria: Optional[str] = None
     top: List[Dict[str, object]]
 
-# ---------- endpoints básicos ----------
+# ---------- ROOT / HEALTH / METADATA ----------
+@app.get("/")
+def home():
+    return {
+        "ok": True,
+        "service": "ventas-sqlite-api",
+        "docs": "/docs",
+        "health": "/health",
+        "tabla": TABLA,
+        "public": PUBLIC_MODE
+    }
+
 @app.get("/health")
 def health():
     with get_conn() as conn:
@@ -668,66 +679,91 @@ def ventas_anuales_vista(
         "ventas_anuales": [{"Anio": k, "Total": float(round(v,2))} for k, v in anual.items()]
     }
 
-# --------- ALIAS explícitos (útiles para Actions) ----------
+# --------- ALIAS explícitos (útiles para Actions / agentes) ----------
 @app.get("/ventas_mensuales_por_grupo", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_grupo(
-    grupo_inventario: str = Query(...),
+    # acepta ambos nombres
+    grupo_inventario: Optional[str] = Query(None, alias="grupo_inventario"),
+    grupo: Optional[str] = Query(None, alias="grupo"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    gi = grupo_inventario or grupo
+    if not gi:
+        raise HTTPException(422, "Debe enviar 'grupo_inventario' o 'grupo'.")
     return ventas_mensuales_vista(desde=desde, hasta=hasta,
-                                  grupo_inventario=grupo_inventario,
+                                  grupo_inventario=gi,
                                   categoria=None, producto=None)
 
 @app.get("/ventas_mensuales_por_categoria", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_categoria(
-    categoria: str = Query(...),
+    categoria: Optional[str] = Query(None, alias="categoria"),
+    category: Optional[str] = Query(None, alias="category"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    cat = categoria or category
+    if not cat:
+        raise HTTPException(422, "Debe enviar 'categoria' (o 'category').")
     return ventas_mensuales_vista(desde=desde, hasta=hasta,
                                   grupo_inventario=None,
-                                  categoria=categoria, producto=None)
+                                  categoria=cat, producto=None)
 
 @app.get("/ventas_mensuales_por_producto", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_producto(
-    producto: str = Query(...),
+    producto: Optional[str] = Query(None, alias="producto"),
+    product: Optional[str]  = Query(None, alias="product"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    prod = producto or product
+    if not prod:
+        raise HTTPException(422, "Debe enviar 'producto' (o 'product').")
     return ventas_mensuales_vista(desde=desde, hasta=hasta,
                                   grupo_inventario=None,
-                                  categoria=None, producto=producto)
+                                  categoria=None, producto=prod)
 
 @app.get("/ventas_anuales_por_grupo", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_grupo(
-    grupo_inventario: str = Query(...),
+    grupo_inventario: Optional[str] = Query(None, alias="grupo_inventario"),
+    grupo: Optional[str] = Query(None, alias="grupo"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    gi = grupo_inventario or grupo
+    if not gi:
+        raise HTTPException(422, "Debe enviar 'grupo_inventario' o 'grupo'.")
     return ventas_anuales_vista(desde=desde, hasta=hasta,
-                                grupo_inventario=grupo_inventario,
+                                grupo_inventario=gi,
                                 categoria=None, producto=None)
 
 @app.get("/ventas_anuales_por_categoria", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_categoria(
-    categoria: str = Query(...),
+    categoria: Optional[str] = Query(None, alias="categoria"),
+    category: Optional[str] = Query(None, alias="category"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    cat = categoria or category
+    if not cat:
+        raise HTTPException(422, "Debe enviar 'categoria' (o 'category').")
     return ventas_anuales_vista(desde=desde, hasta=hasta,
                                 grupo_inventario=None,
-                                categoria=categoria, producto=None)
+                                categoria=cat, producto=None)
 
 @app.get("/ventas_anuales_por_producto", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_producto(
-    producto: str = Query(...),
+    producto: Optional[str] = Query(None, alias="producto"),
+    product: Optional[str]  = Query(None, alias="product"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    prod = producto or product
+    if not prod:
+        raise HTTPException(422, "Debe enviar 'producto' (o 'product').")
     return ventas_anuales_vista(desde=desde, hasta=hasta,
                                 grupo_inventario=None,
-                                categoria=None, producto=producto)
+                                categoria=None, producto=prod)
 
 # ---------- Descubrimiento de valores (para evitar "nombre exacto") ----------
 def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
