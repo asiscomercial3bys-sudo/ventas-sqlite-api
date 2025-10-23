@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="2.7.0")
+app = FastAPI(title="Ventas API (SQLite)", version="2.8.0")
 
 # CORS abierto
 app.add_middleware(
@@ -164,6 +164,9 @@ def extract_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s))
 
 def parse_number_series(s: pd.Series) -> pd.Series:
+    """
+    Convierte texto numérico con formatos LATAM/EN a float y limpia símbolos.
+    """
     if s.empty:
         return s.astype(float)
     x = s.astype(str).str.replace(r"[\$\s\*\#\(\)]", "", regex=True)
@@ -231,61 +234,7 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
     sql = f"SELECT {', '.join(sel)} FROM [{TABLA}] WHERE 1=1 {extra_where}"
     return sql, []
 
-# ---------- VISTAS (para series mensuales/anuales) ----------
-def ensure_views_exist():
-    """
-    Crea las vistas v_ventas_mensual y v_ventas_anual si no existen.
-    Usa los nombres reales de columnas detectados en COLS.
-    """
-    fec = COLS["Fecha"]
-    grp = COLS.get("GrupoInventario")
-    cat = COLS.get("Categoria")
-    pro = COLS["Producto"]
-    qty = COLS["Cantidad"]
-    sub = COLS["Subtotal"]
-
-    grp_sql = f"[{grp}]" if grp else "'N/A'"
-    cat_sql = f"[{cat}]" if cat else "'N/A'"
-
-    # Limpieza numérica en SQL (simple, portable)
-    def clean_sql(colname: str) -> str:
-        base = f"replace(replace(replace(replace([{colname}],' ',''), '$',''), ',', '.'), chr(160), '')"
-        return f"CAST({base} AS REAL)"
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute(f"""
-        CREATE VIEW IF NOT EXISTS v_ventas_mensual AS
-        SELECT
-          strftime('%Y-%m', [{fec}]) AS Periodo,
-          COALESCE({grp_sql}, 'N/A') AS GrupoInventario,
-          COALESCE({cat_sql}, 'N/A') AS Categoria,
-          COALESCE([{pro}], 'N/A') AS Producto,
-          SUM({clean_sql(sub)}) AS Subtotal,
-          SUM({clean_sql(qty)}) AS Cantidad
-        FROM [{TABLA}]
-        GROUP BY Periodo, GrupoInventario, Categoria, Producto;
-        """)
-
-        cur.execute(f"""
-        CREATE VIEW IF NOT EXISTS v_ventas_anual AS
-        SELECT
-          strftime('%Y', [{fec}]) AS Anio,
-          COALESCE({grp_sql}, 'N/A') AS GrupoInventario,
-          COALESCE({cat_sql}, 'N/A') AS Categoria,
-          COALESCE([{pro}], 'N/A') AS Producto,
-          SUM({clean_sql(sub)}) AS Subtotal,
-          SUM({clean_sql(qty)}) AS Cantidad
-        FROM [{TABLA}]
-        GROUP BY Anio, GrupoInventario, Categoria, Producto;
-        """)
-        conn.commit()
-
-# crear/actualizar vistas al iniciar
-ensure_views_exist()
-
-# ---------- modelos ----------
+# ---------- MODELOS ----------
 class TopItem(BaseModel):
     nombre: str
     valor: float
@@ -602,57 +551,119 @@ def tops(
         top=resultado
     )
 
-# ---------- Series por VISTAS ----------
-@app.get("/ventas_mensuales_vista")
+# ---------- Series (MENSUAL / ANUAL) sin vistas ----------
+def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tuple[str,str]:
+    """
+    Si no envían desde/hasta, usa todo el rango disponible en la base (por fecha).
+    """
+    fec_col = COLS["Fecha"]
+    with get_conn() as conn:
+        r = pd.read_sql(f"SELECT MIN(date([{fec_col}])) AS d1, MAX(date([{fec_col}])) AS d2 FROM [{TABLA}]", conn).iloc[0]
+    d1 = str(r["d1"]) if pd.notna(r["d1"]) else "1900-01-01"
+    d2 = str(r["d2"]) if pd.notna(r["d2"]) else "2100-12-31"
+    return (desde or d1, hasta or d2)
+
+def _build_sales_df(desde: str, hasta: str,
+                    grupo_inventario: Optional[str],
+                    categoria: Optional[str],
+                    producto: Optional[str]) -> pd.DataFrame:
+    """
+    Devuelve un DataFrame con: Fecha, Subtotal, GrupoInventario, Categoria, Producto
+    y aplica filtros robustos si se piden.
+    """
+    val_col = COLS.get("Subtotal")
+    if not val_col:
+        raise HTTPException(500, "No existe columna Subtotal en la base.")
+    fec_col = COLS["Fecha"]
+    grp_col = COLS.get("GrupoInventario")
+    cat_col = COLS.get("Categoria")
+    pro_col = COLS["Producto"]
+
+    where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
+    params: List[str] = [desde, hasta]
+
+    add_text_filter(where, params, grupo_inventario, grp_col)
+    add_text_filter(where, params, categoria,        cat_col)
+    add_text_filter(where, params, producto,         pro_col)
+
+    sql = f"""
+      SELECT [{fec_col}] AS Fecha,
+             [{val_col}] AS Subtotal,
+             { (f"[{grp_col}] AS GrupoInventario" if grp_col else "'N/A' AS GrupoInventario") },
+             { (f"[{cat_col}] AS Categoria"      if cat_col else "'N/A' AS Categoria") },
+             [{pro_col}]  AS Producto
+      FROM [{TABLA}]
+      WHERE {" AND ".join(where)}
+    """
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql(sql, conn, params=params)
+    except Exception as e:
+        raise HTTPException(400, f"Consulta inválida: {e}")
+
+    if df.empty:
+        raise HTTPException(404, "No hay registros para el filtro/periodo indicado.")
+
+    df["Subtotal"] = parse_number_series(df["Subtotal"])
+    if df["Subtotal"].sum() == 0:
+        raise HTTPException(404, "No hay valores en 'Subtotal' para el filtro/periodo indicado.")
+
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    df = df.dropna(subset=["Fecha"])
+    return df
+
+@app.get("/ventas_mensuales_vista", dependencies=[Depends(require_auth)])
 def ventas_mensuales_vista(
-    grupo_inventario: Optional[str] = None,
-    categoria: Optional[str] = None,
-    producto: Optional[str] = None
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    grupo_inventario: Optional[str] = Query(None, description="Filtro por grupo inventario (flexible)"),
+    categoria:        Optional[str] = Query(None, description="Filtro por categoría (flexible)"),
+    producto:         Optional[str] = Query(None, description="Filtro por producto (flexible)"),
+    top_n:            Optional[int] = Query(None, ge=1, le=100, description="Opcional: devolver solo top N meses por monto")
 ):
-    """Devuelve el resumen mensual por grupo/categoría/producto usando v_ventas_mensual."""
-    with get_conn() as conn:
-        base = "SELECT Periodo, GrupoInventario, Categoria, Producto, Subtotal FROM v_ventas_mensual WHERE 1=1"
-        params: List[str] = []
-        if grupo_inventario:
-            base += " AND lower(replace(GrupoInventario,' ','')) LIKE ?"
-            params.append(f"%{grupo_inventario.lower().replace(' ','')}%")
-        if categoria:
-            base += " AND lower(replace(Categoria,' ','')) LIKE ?"
-            params.append(f"%{categoria.lower().replace(' ','')}%")
-        if producto:
-            base += " AND lower(replace(Producto,' ','')) LIKE ?"
-            params.append(f"%{producto.lower().replace(' ','')}%")
+    d,h = _ensure_period_or_default(desde, hasta)
+    ensure_period(d, h)
 
-        df = pd.read_sql(base, conn, params=params)
-        if df.empty:
-            raise HTTPException(404, "No se encontraron ventas para esos filtros.")
-        df["Subtotal"] = parse_number_series(df["Subtotal"])
-        resumen = df.groupby("Periodo")["Subtotal"].sum().round(2).to_dict()
-    return {"series_mensuales": resumen}
+    df = _build_sales_df(d, h, grupo_inventario, categoria, producto)
+    df["YYYYMM"] = df["Fecha"].dt.strftime("%Y-%m")
+    mens = df.groupby("YYYYMM", dropna=False)["Subtotal"].sum().sort_index()
 
-@app.get("/ventas_anuales_vista")
+    if top_n:
+        mens = mens.sort_values(ascending=False).head(top_n).sort_index()
+
+    return {
+        "ok": True,
+        "filtros": {
+            "desde": d, "hasta": h,
+            "grupo_inventario": grupo_inventario,
+            "categoria": categoria,
+            "producto": producto
+        },
+        "series_mensuales": {k: float(v) for k,v in mens.round(2).items()}
+    }
+
+@app.get("/ventas_anuales_vista", dependencies=[Depends(require_auth)])
 def ventas_anuales_vista(
-    grupo_inventario: Optional[str] = None,
-    categoria: Optional[str] = None,
-    producto: Optional[str] = None
+    desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
+    grupo_inventario: Optional[str] = Query(None),
+    categoria:        Optional[str] = Query(None),
+    producto:         Optional[str] = Query(None)
 ):
-    """Devuelve el resumen anual por grupo/categoría/producto usando v_ventas_anual."""
-    with get_conn() as conn:
-        base = "SELECT Anio, GrupoInventario, Categoria, Producto, Subtotal FROM v_ventas_anual WHERE 1=1"
-        params: List[str] = []
-        if grupo_inventario:
-            base += " AND lower(replace(GrupoInventario,' ','')) LIKE ?"
-            params.append(f"%{grupo_inventario.lower().replace(' ','')}%")
-        if categoria:
-            base += " AND lower(replace(Categoria,' ','')) LIKE ?"
-            params.append(f"%{categoria.lower().replace(' ','')}%")
-        if producto:
-            base += " AND lower(replace(Producto,' ','')) LIKE ?"
-            params.append(f"%{producto.lower().replace(' ','')}%")
+    d,h = _ensure_period_or_default(desde, hasta)
+    ensure_period(d, h)
 
-        df = pd.read_sql(base, conn, params=params)
-        if df.empty:
-            raise HTTPException(404, "No se encontraron ventas para esos filtros.")
-        df["Subtotal"] = parse_number_series(df["Subtotal"])
-        resumen = df.groupby("Anio")["Subtotal"].sum().round(2).to_dict()
-    return {"series_anuales": resumen}
+    df = _build_sales_df(d, h, grupo_inventario, categoria, producto)
+    df["YYYY"] = df["Fecha"].dt.year.astype(str)
+    anual = df.groupby("YYYY", dropna=False)["Subtotal"].sum().sort_index()
+
+    return {
+        "ok": True,
+        "filtros": {
+            "desde": d, "hasta": h,
+            "grupo_inventario": grupo_inventario,
+            "categoria": categoria,
+            "producto": producto
+        },
+        "series_anuales": {k: float(v) for k,v in anual.round(2).items()}
+    }
