@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---------- rutas y seguridad ----------
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "ventas2025.sqlite"   # Ruta relativa (Render y local)
+DB_PATH = BASE_DIR / "ventas2025.sqlite"   # Ruta para Render y local
 
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "1") == "1"
 API_KEY = os.getenv("API_KEY")
@@ -26,14 +26,11 @@ def require_auth(authorization: str = Header(None)):
     if token != API_KEY:
         raise HTTPException(403, "Token inválido")
 
-# ---------- config ----------
-DEFAULT_TABLE_HINTS = [
-    "comparativo_emp._2024_vs_2025",
-    "ventas_2025", "ventas", "reporte", "hoja1"
-]
+# ---------- configuración ----------
+DEFAULT_TABLE_HINTS = ["ventas_2025", "ventas", "reporte", "hoja1"]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="3.1.0")
+app = FastAPI(title="Ventas API (SQLite)", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,13 +40,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- util db ----------
+# ---------- conexión y helpers ----------
 def get_conn():
     if not DB_PATH.exists():
         raise HTTPException(500, f"No existe la base en {DB_PATH}")
     return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
-# ✅ NUEVO HELPER
 def query_db(sql: str, params: List = []) -> List[Dict]:
     """Ejecuta una consulta SQL y devuelve una lista de diccionarios."""
     try:
@@ -59,7 +55,6 @@ def query_db(sql: str, params: List = []) -> List[Dict]:
     except Exception as e:
         raise HTTPException(400, f"Error ejecutando consulta: {e}")
 
-# ---------- autodetección ----------
 def normalize(s: str) -> str:
     s = str(s).lower()
     s = re.sub(r"[\s_]+", "", s)
@@ -99,6 +94,7 @@ def map_columns(tbl: str) -> Dict[str, str]:
     m["Producto"] = norm_map.get("producto")
     m["Cantidad"] = norm_map.get("cantidad")
     m["Subtotal"] = norm_map.get("subtotal")
+    m["Portafolio"] = norm_map.get("portafolio") or m.get("GrupoInventario")
     return m
 
 COLS = map_columns(TABLA)
@@ -111,9 +107,6 @@ def ensure_period(desde: str, hasta: str):
     if desde > hasta:
         raise HTTPException(422, "El rango de fechas es inválido (desde > hasta).")
 
-def extract_digits(s: str) -> str:
-    return re.sub(r"\D+", "", str(s))
-
 def parse_number_series(s: pd.Series) -> pd.Series:
     if s.empty:
         return s.astype(float)
@@ -121,25 +114,19 @@ def parse_number_series(s: pd.Series) -> pd.Series:
     x = x.str.replace(",", ".", regex=False)
     return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
-# ---------- MODELOS ----------
+# ---------- modelos ----------
 class TopItem(BaseModel):
     nombre: str
     valor: float
 
 class ResumenCliente(BaseModel):
     cliente: str
-    cliente_id: Optional[str] = None
     desde: str
     hasta: str
-    total_unidades: float
     total_valor_subtotal: float
-    ticket_promedio: float
-    ventas_por_grupo: Dict[str, float]
-    top_productos: List[TopItem]
-    mensual_ventas: Dict[str, float]
-    mensual_unidades: Dict[str, float]
+    resumen: List[Dict[str, object]]
 
-# ---------- ROOT ----------
+# ---------- health ----------
 @app.get("/")
 def home():
     return {"ok": True, "tabla": TABLA, "public": PUBLIC_MODE, "docs": "/docs"}
@@ -150,116 +137,75 @@ def health():
         fec_col = COLS["Fecha"]
         dfc = pd.read_sql(f"SELECT count(*) as n FROM [{TABLA}] WHERE [{fec_col}] IS NOT NULL", conn)
     cnt = int(dfc.iloc[0]["n"])
-    return {"ok": True, "rows_con_fecha": cnt, "cols": COLS}
+    return {"ok": True, "tabla": TABLA, "cols": COLS, "rows_con_fecha": cnt}
 
-# ---------- CONSULTA CLIENTE ----------
-@app.get("/consulta_cliente", response_model=ResumenCliente)
-def consulta_cliente(
-    cliente: Optional[str] = Query(None),
-    identificacion: Optional[str] = Query(None),
+# ---------- nuevo endpoint: resumen por cliente ----------
+@app.get("/resumen_cliente_general", response_model=ResumenCliente)
+def resumen_cliente_general(
+    cliente: str = Query(..., min_length=3, description="Nombre del cliente"),
     desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    grupo_inventario: Optional[str] = None,
-    categoria: Optional[str] = None
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$")
 ):
+    """
+    Devuelve el resumen del cliente agrupado por Portafolio, Grupo de Inventario y Categoría.
+    Valores expresados en Subtotal ($).
+    """
     ensure_period(desde, hasta)
-    val_col = COLS.get("Subtotal")
-    cli_col = COLS.get("Cliente")
-    fec_col = COLS.get("Fecha")
-    grp_col = COLS.get("GrupoInventario")
-    cat_col = COLS.get("Categoria")
-
-    where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
-    params = [desde, hasta]
-    if cliente:
-        where.append(f"lower([{cli_col}]) LIKE ?")
-        params.append(f"%{cliente.lower()}%")
-    if grupo_inventario:
-        where.append(f"lower([{grp_col}]) LIKE ?")
-        params.append(f"%{grupo_inventario.lower()}%")
-    if categoria:
-        where.append(f"lower([{cat_col}]) LIKE ?")
-        params.append(f"%{categoria.lower()}%")
+    val_col = COLS["Subtotal"]
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
+    port_col = COLS["Portafolio"]
+    grp_col = COLS["GrupoInventario"]
+    cat_col = COLS["Categoria"]
 
     sql = f"""
-        SELECT [{cli_col}] AS Cliente, [{grp_col}] AS GrupoInventario,
-               [{cat_col}] AS Categoria, [{COLS.get('Producto')}] AS Producto,
-               SUM([{val_col}]) AS Subtotal
-        FROM [{TABLA}]
-        WHERE {' AND '.join(where)}
-        GROUP BY [{cli_col}], [{grp_col}], [{cat_col}], [{COLS.get('Producto')}]
-    """
-    df = pd.read_sql(sql, get_conn(), params=params)
-    if df.empty:
-        raise HTTPException(404, "No se encontraron registros.")
-
-    total_valor = df["Subtotal"].sum()
-    total_unidades = len(df)
-    ticket_prom = total_valor / total_unidades
-
-    return ResumenCliente(
-        cliente=cliente or "N/A",
-        cliente_id=None,
-        desde=desde,
-        hasta=hasta,
-        total_unidades=float(total_unidades),
-        total_valor_subtotal=float(total_valor),
-        ticket_promedio=float(ticket_prom),
-        ventas_por_grupo=df.groupby("GrupoInventario")["Subtotal"].sum().to_dict(),
-        top_productos=[
-            TopItem(nombre=r["Producto"], valor=float(r["Subtotal"])) for _, r in df.nlargest(10, "Subtotal").iterrows()
-        ],
-        mensual_ventas={},
-        mensual_unidades={}
-    )
-
-# ✅ NUEVO ENDPOINT GLOBAL
-@app.get("/consulta_grupo", summary="Consulta global por grupo de inventario")
-def consulta_grupo(
-    grupo_inventario: str = Query(..., min_length=2),
-    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    categoria: Optional[str] = None,
-):
-    ensure_period(desde, hasta)
-    val_col = COLS.get("Subtotal")
-    grp_col = COLS.get("GrupoInventario")
-    cat_col = COLS.get("Categoria")
-    prod_col = COLS.get("Producto")
-    fec_col = COLS.get("Fecha")
-
-    if not all([val_col, grp_col, cat_col, prod_col]):
-        raise HTTPException(500, "Estructura de columnas incompleta. Revisa COLS.")
-
-    where = [f"date([{fec_col}]) BETWEEN ? AND ?", f"[{grp_col}] LIKE ?"]
-    params = [desde, hasta, f"%{grupo_inventario}%"]
-    if categoria:
-        where.append(f"[{cat_col}] LIKE ?")
-        params.append(f"%{categoria}%")
-
-    query = f"""
-        SELECT [{grp_col}] AS GrupoInventario,
+        SELECT [{port_col}] AS Portafolio,
+               [{grp_col}] AS GrupoInventario,
                [{cat_col}] AS Categoria,
-               [{prod_col}] AS Producto,
                SUM([{val_col}]) AS Subtotal
         FROM [{TABLA}]
-        WHERE {' AND '.join(where)}
-        GROUP BY [{grp_col}], [{cat_col}], [{prod_col}]
+        WHERE lower([{cli_col}]) LIKE ?
+        AND date([{fec_col}]) BETWEEN ? AND ?
+        GROUP BY [{port_col}], [{grp_col}], [{cat_col}]
         ORDER BY Subtotal DESC
     """
-    rows = query_db(query, params)
-    if not rows:
-        raise HTTPException(404, f"No se encontraron registros para el grupo '{grupo_inventario}'.")
-    return {
-        "grupo_inventario": grupo_inventario,
-        "desde": desde,
-        "hasta": hasta,
-        "categoria": categoria or "TODAS",
-        "total_registros": len(rows),
-        "ventas": rows
-    }
+    params = [f"%{cliente.lower()}%", desde, hasta]
 
-# ---------- resto de endpoints (tops, ventas, valores, etc.) ----------
-# ✅ aquí mantienes todos los endpoints adicionales de tu versión extendida
-# (no se modifican)
+    with get_conn() as conn:
+        df = pd.read_sql(sql, conn, params=params)
 
+    if df.empty:
+        raise HTTPException(404, f"No se encontraron ventas para '{cliente}' en el rango {desde} → {hasta}.")
+
+    df["Subtotal"] = parse_number_series(df["Subtotal"])
+    total = float(df["Subtotal"].sum())
+
+    resumen = df.round(2).to_dict(orient="records")
+
+    return ResumenCliente(
+        cliente=cliente,
+        desde=desde,
+        hasta=hasta,
+        total_valor_subtotal=total,
+        resumen=resumen
+    )
+
+# ---------- informe texto simple ----------
+@app.get("/informe_cliente_texto")
+def informe_cliente_texto(
+    cliente: str,
+    desde: str,
+    hasta: str
+):
+    """Versión texto del resumen por cliente."""
+    r = resumen_cliente_general(cliente=cliente, desde=desde, hasta=hasta)
+    lineas = [
+        f"🧾 Informe de ventas — {r.cliente}",
+        f"Periodo: {r.desde} → {r.hasta}",
+        f"Total ventas (subtotal): ${r.total_valor_subtotal:,.2f}",
+        "",
+        "Detalle por Portafolio / Grupo / Categoría:"
+    ]
+    for row in r.resumen:
+        lineas.append(f"  - {row['Portafolio']} / {row['GrupoInventario']} / {row['Categoria']}: ${row['Subtotal']:,.2f}")
+    return {"informe": "\n".join(lineas)}
