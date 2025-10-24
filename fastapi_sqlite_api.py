@@ -613,12 +613,13 @@ def tops(
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
         resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
 
-    return Respuesta(
-        entidad=entidad, orden=orden, frecuencia=frecuencia,
-        desde=desde, hasta=hasta,
-        grupo_inventario=grupo_inventario, categoria=categoria,
-        =resultado
-    )
+ return Respuesta(
+    entidad=entidad, orden=orden, frecuencia=frecuencia,
+    desde=desde, hasta=hasta,
+    grupo_inventario=grupo_inventario, categoria=categoria,
+    resultado=resultado
+)
+
 
 # ---------- Series (MENSUAL / ANUAL) LIMPIAS ----------
 def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tuple[str,str]:
@@ -868,5 +869,6 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
+
 
 
