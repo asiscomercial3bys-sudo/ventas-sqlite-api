@@ -246,7 +246,7 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
     return sql, []
 
 # ---------- MODELOS ----------
-class TopItem(BaseModel):
+class Item(BaseModel):
     nombre: str
     valor: float
 
@@ -310,8 +310,8 @@ def consulta_cliente(
     identificacion: Optional[str] = Query(None, description="Identificación exacta o parcial (solo números serán usados)"),
     desde: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    grupo_inventario: Optional[str] = Query(None, description="Filtra por grupo de inventario (opcional)"),
-    categoria: Optional[str] = Query(None, description="Filtra por categoría (opcional)")
+    grupo_inventario: Optional[str] = Query(None, description="Filtra por grupo de inventario"),
+    categoria: Optional[str] = Query(None, description="Filtra por categoría")
 ):
     ensure_period(desde, hasta)
     val_col = COLS.get("Subtotal")
@@ -563,11 +563,11 @@ def tops(
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
         resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
 
-    return TopRespuesta(
+    return Respuesta(
         entidad=entidad, orden=orden, frecuencia=frecuencia,
         desde=desde, hasta=hasta,
         grupo_inventario=grupo_inventario, categoria=categoria,
-        top=resultado
+        =resultado
     )
 
 # ---------- Series (MENSUAL / ANUAL) LIMPIAS ----------
@@ -818,3 +818,4 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
+
