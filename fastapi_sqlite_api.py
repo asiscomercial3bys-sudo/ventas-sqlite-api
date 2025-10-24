@@ -38,7 +38,7 @@ DEFAULT_TABLE_HINTS = [
 ]
 
 # ---------- app ----------
-app = FastAPI(title="Ventas API (SQLite)", version="3.0.0")
+app = FastAPI(title="Ventas API (SQLite)", version="3.0.1")
 
 # CORS abierto
 app.add_middleware(
@@ -183,13 +183,21 @@ def parse_number_series(s: pd.Series) -> pd.Series:
 def sql_norm_column(col: str) -> str:
     """
     Normaliza una columna en SQL: minúsculas, sin espacios, signos ni acentos (LATAM).
+    OJO: comillas se limpian con char(39)/char(34) para no romper el SQL.
     """
     x = f"lower([{col}])"
     x = f"replace({x}, char(160), '')"  # NBSP
     x = f"replace({x}, ' ', '')"
-    for ch in [".", ",", "-", "/", "+", "_", "(", ")", "'", '"']:
+    # signos seguros como literales
+    for ch in [".", ",", "-", "/", "+", "_", "(", ")"]:
         x = f"replace({x}, '{ch}', '')"
-    for a,b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),("ñ","n")]:
+    # comilla simple y doble con char() para evitar "unrecognized token"
+    x = f"replace({x}, char(39), '')"  # '
+    x = f"replace({x}, char(34), '')"  # "
+    # acentos y eñes
+    for a,b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),
+                ("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),
+                ("ñ","n")]:
         x = f"replace({x}, '{a}', '{b}')"
     return x
 
@@ -593,7 +601,7 @@ def _build_sales_df(desde: str, hasta: str,
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
     params: List[str] = [desde, hasta]
 
-    # --- FIX CLAVE: normalizamos COLUMNA y VALOR de forma consistente ---
+    # --- normalizamos COLUMNA y VALOR de forma consistente ---
     def add_like(value: Optional[str], col: Optional[str]):
         if value and col:
             norm_col = sql_norm_column(col)
@@ -767,25 +775,28 @@ def ventas_anuales_por_producto(
 
 # ---------- Descubrimiento de valores (para evitar "nombre exacto") ----------
 def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
-    with get_conn() as conn:
-        where = f"WHERE [{col_real}] IS NOT NULL"
-        params: List[str] = []
-        if contiene:
-            norm_col = sql_norm_column(col_real)
-            norm_val = py_norm_text(contiene)
-            where += f" AND {norm_col} LIKE ?"
-            params.append(f"%{norm_val}%")
-        sql = f"""
-            SELECT [{col_real}] AS valor, COUNT(*) AS conteo
-            FROM [{TABLA}]
-            {where}
-            GROUP BY [{col_real}]
-            ORDER BY conteo DESC
-            LIMIT ?
-        """
-        params.append(int(limite))
-        df = pd.read_sql(sql, conn, params=params)
-    return {"items": df.to_dict(orient="records")}
+    try:
+        with get_conn() as conn:
+            where = f"WHERE [{col_real}] IS NOT NULL"
+            params: List[str] = []
+            if contiene:
+                norm_col = sql_norm_column(col_real)
+                norm_val = py_norm_text(contiene)
+                where += f" AND {norm_col} LIKE ?"
+                params.append(f"%{norm_val}%")
+            sql = f"""
+                SELECT [{col_real}] AS valor, COUNT(*) AS conteo
+                FROM [{TABLA}]
+                {where}
+                GROUP BY [{col_real}]
+                ORDER BY conteo DESC
+                LIMIT ?
+            """
+            params.append(int(limite))
+            df = pd.read_sql(sql, conn, params=params)
+        return {"items": df.to_dict(orient="records")}
+    except Exception as e:
+        raise HTTPException(400, f"Consulta inválida en valores/{col_real}: {e}")
 
 @app.get("/valores/grupos", dependencies=[Depends(require_auth)])
 def valores_grupos(contiene: Optional[str] = None, limite: int = 200):
