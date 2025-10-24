@@ -436,7 +436,57 @@ def consulta_cliente(
         mensual_ventas={k: float(v) for k, v in mens_val.items()},
         mensual_unidades={k: float(v) for k, v in mens_qty.items()}
     )
+# ---------------------------------------------
+# NUEVA RUTA: CONSULTA GLOBAL POR GRUPO
+# ---------------------------------------------
+@app.get("/consulta_grupo", summary="Consulta global por grupo de inventario")
+def consulta_grupo(
+    grupo_inventario: str = Query(..., min_length=2, description="Nombre exacto o parcial del grupo de inventario"),
+    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    categoria: Optional[str] = Query(None, description="Filtra una categoría específica dentro del grupo"),
+):
+    ensure_period(desde, hasta)
+    val_col = COLS.get("Subtotal")
+    grp_col = COLS.get("GrupoInventario")
+    cat_col = COLS.get("Categoria")
+    prod_col = COLS.get("Producto")
+    fec_col = COLS.get("Fecha")
 
+    if not all([val_col, grp_col, cat_col, prod_col]):
+        raise HTTPException(500, "Estructura de columnas incompleta. Revisa COLS.")
+
+    where = [f"date([{fec_col}]) BETWEEN ? AND ?", f"[{grp_col}] LIKE ?"]
+    params = [desde, hasta, f"%{grupo_inventario}%"]
+
+    if categoria:
+        where.append(f"[{cat_col}] LIKE ?")
+        params.append(f"%{categoria}%")
+
+    query = f"""
+        SELECT [{grp_col}] AS GrupoInventario,
+               [{cat_col}] AS Categoria,
+               [{prod_col}] AS Producto,
+               SUM([{val_col}]) AS Subtotal
+        FROM Ventas
+        WHERE {' AND '.join(where)}
+        GROUP BY [{grp_col}], [{cat_col}], [{prod_col}]
+        ORDER BY Subtotal DESC
+    """
+
+    rows = query_db(query, params)
+
+    if not rows:
+        raise HTTPException(404, f"No se encontraron registros para el grupo '{grupo_inventario}'.")
+
+    return {
+        "grupo_inventario": grupo_inventario,
+        "desde": desde,
+        "hasta": hasta,
+        "categoria": categoria or "TODAS",
+        "total_registros": len(rows),
+        "ventas": rows
+    }
 # ---------- informe (texto) ----------
 @app.get("/informe_cliente", dependencies=[Depends(require_auth)])
 def informe_cliente(
@@ -818,4 +868,5 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
+
 
