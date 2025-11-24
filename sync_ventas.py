@@ -1,3 +1,27 @@
+from datetime import datetime
+
+def to_date(value):
+    """
+    Convierte fechas DD/MM/YYYY a YYYY-MM-DD.
+    Si ya viene en formato correcto, la devuelve igual.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if value == "":
+        return None
+
+    try:
+        # Si viene como DD/MM/YYYY → convertir
+        return datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except:
+        pass
+
+    try:
+        # Si ya está en formato YYYY-MM-DD
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except:
+        return None
 import os
 import csv
 import requests
