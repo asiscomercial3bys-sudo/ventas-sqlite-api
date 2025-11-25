@@ -1,49 +1,37 @@
 import os
 import csv
+import io
+from datetime import datetime
+
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime
 
-# Aumentar el límite de tamaño de campo del CSV
-# (para evitar _csv.Error: campo mayor que el límite del campo (131072))
-csv.field_size_limit(10**7)
+# subir límite de tamaño de campo del CSV
+csv.field_size_limit(10_000_000)  # 10 MB por celda, de sobra
 
-# =========================
-#  Variables de entorno
-# =========================
 
+# Variables de entorno
 DATABASE_URL = os.environ["DATABASE_URL"]   # URL de Neon (Postgres)
-CSV_URL = os.environ["CSV_URL"]             # Link directo al CSV de OneDrive/SharePoint
+CSV_URL = os.environ["CSV_URL"]             # Link directo al CSV
 
 
-# =========================
-#  Helpers de conversión
-# =========================
+# ---- Helpers ----
 
 def to_date(value):
-    """
-    Convierte fechas DD/MM/YYYY a YYYY-MM-DD.
-    Si ya viene en formato correcto, la devuelve igual.
-    Devuelve None si no se puede interpretar.
-    """
     if not value:
         return None
-    value = str(value).strip()
+    value = value.strip()
     if value == "":
         return None
 
-    # Intento 1: DD/MM/YYYY (formato típico de Excel en español)
-    try:
-        return datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    # Intento 2: YYYY-MM-DD (ya en formato ISO)
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except Exception:
-        return None
+    # DD/MM/YYYY
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
 def to_int(value):
@@ -59,17 +47,12 @@ def to_int(value):
 
 
 def to_num(value):
-    """
-    Convierte textos como '1.234,56' o '1234.56' a float.
-    Devuelve None si está vacío o no se puede convertir.
-    """
     if value is None:
         return None
     value = str(value).strip()
     if value == "":
         return None
 
-    # quitar separador de miles y normalizar coma a punto
     value = value.replace(".", "").replace(",", ".")
     try:
         return float(value)
@@ -77,42 +60,28 @@ def to_num(value):
         return None
 
 
-# =========================
-#  Lectura en streaming del CSV
-# =========================
-
 def iter_csv_rows(url: str):
-    """
-    Descarga el CSV de forma 'streaming' y devuelve un iterador de filas (dicts).
-    NO carga todo el archivo en memoria.
-    """
     print(f"Descargando CSV desde: {url}")
     resp = requests.get(url, stream=True)
     resp.raise_for_status()
 
-    # Algunas veces el CSV tiene BOM o caracteres raros al inicio; los ignoramos.
     lines = (
         line.decode("utf-8-sig", errors="ignore")
         for line in resp.iter_lines(decode_unicode=False)
-        if line  # saltar líneas vacías
+        if line
     )
 
-    # IMPORTANTE: el delimitador es ; porque tu Excel en español guarda así el CSV
+    # tu archivo va con ;
     reader = csv.DictReader(lines, delimiter=";")
     print(f"Encabezados detectados: {reader.fieldnames}")
     return reader
 
-
-# =========================
-#  Sincronización con Neon
-# =========================
 
 def sync_ventas(batch_size: int = 1000):
     print("Conectando a la base de datos...")
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Opcional: vaciar tabla antes de cargar
     print("Vaciando tabla ventas (TRUNCATE)...")
     cur.execute("TRUNCATE TABLE ventas;")
     conn.commit()
@@ -149,12 +118,10 @@ def sync_ventas(batch_size: int = 1000):
     total_insertadas = 0
     batch = []
 
-    # Recorrer filas del CSV en streaming
     for row in iter_csv_rows(CSV_URL):
-        # OJO: los nombres deben coincidir con los encabezados reales de tu CSV
         valores = (
             to_int(row.get("Año")),
-            to_date(row.get("Fecha")),                 # ← aquí usamos to_date
+            to_date(row.get("Fecha")),
             row.get("Mes"),
             row.get("Identificación+Suc"),
             row.get("Identificación"),
@@ -181,7 +148,6 @@ def sync_ventas(batch_size: int = 1000):
 
         batch.append(valores)
 
-        # Cuando el lote alcance batch_size, lo enviamos a Neon
         if len(batch) >= batch_size:
             execute_values(cur, insert_sql, batch)
             conn.commit()
@@ -189,7 +155,6 @@ def sync_ventas(batch_size: int = 1000):
             print(f"Lote insertado. Acumuladas: {total_insertadas} filas.")
             batch.clear()
 
-    # Insertar el último lote si quedó algo pendiente
     if batch:
         execute_values(cur, insert_sql, batch)
         conn.commit()
