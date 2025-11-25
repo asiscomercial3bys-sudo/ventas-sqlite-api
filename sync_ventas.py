@@ -1,39 +1,50 @@
-from datetime import datetime
-
-def to_date(value):
-    """
-    Convierte fechas DD/MM/YYYY a YYYY-MM-DD.
-    Si ya viene en formato correcto, la devuelve igual.
-    """
-    if not value:
-        return None
-    value = value.strip()
-    if value == "":
-        return None
-
-    try:
-        # Si viene como DD/MM/YYYY → convertir
-        return datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except:
-        pass
-
-    try:
-        # Si ya está en formato YYYY-MM-DD
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except:
-        return None
 import os
 import csv
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
+from datetime import datetime
 
-# Variables de entorno
+# Aumentar el límite de tamaño de campo del CSV
+# (para evitar _csv.Error: campo mayor que el límite del campo (131072))
+csv.field_size_limit(10**7)
+
+# =========================
+#  Variables de entorno
+# =========================
+
 DATABASE_URL = os.environ["DATABASE_URL"]   # URL de Neon (Postgres)
 CSV_URL = os.environ["CSV_URL"]             # Link directo al CSV de OneDrive/SharePoint
 
 
-# ---- Helpers para convertir datos ----
+# =========================
+#  Helpers de conversión
+# =========================
+
+def to_date(value):
+    """
+    Convierte fechas DD/MM/YYYY a YYYY-MM-DD.
+    Si ya viene en formato correcto, la devuelve igual.
+    Devuelve None si no se puede interpretar.
+    """
+    if not value:
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+
+    # Intento 1: DD/MM/YYYY (formato típico de Excel en español)
+    try:
+        return datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # Intento 2: YYYY-MM-DD (ya en formato ISO)
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
 
 def to_int(value):
     if value is None:
@@ -66,7 +77,9 @@ def to_num(value):
         return None
 
 
-# ---- Lectura en streaming del CSV ----
+# =========================
+#  Lectura en streaming del CSV
+# =========================
 
 def iter_csv_rows(url: str):
     """
@@ -84,13 +97,15 @@ def iter_csv_rows(url: str):
         if line  # saltar líneas vacías
     )
 
-    # Importante: ajusta el delimitador según tu archivo (; o ,)
+    # IMPORTANTE: el delimitador es ; porque tu Excel en español guarda así el CSV
     reader = csv.DictReader(lines, delimiter=";")
     print(f"Encabezados detectados: {reader.fieldnames}")
     return reader
 
 
-# ---- Sincronización con Neon ----
+# =========================
+#  Sincronización con Neon
+# =========================
 
 def sync_ventas(batch_size: int = 1000):
     print("Conectando a la base de datos...")
@@ -139,7 +154,7 @@ def sync_ventas(batch_size: int = 1000):
         # OJO: los nombres deben coincidir con los encabezados reales de tu CSV
         valores = (
             to_int(row.get("Año")),
-            row.get("Fecha"),
+            to_date(row.get("Fecha")),                 # ← aquí usamos to_date
             row.get("Mes"),
             row.get("Identificación+Suc"),
             row.get("Identificación"),
