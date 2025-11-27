@@ -45,9 +45,11 @@ def require_auth(authorization: str = Header(None)):
     if token != API_KEY:
         raise HTTPException(403, "Token inválido")
 
-
 # ---------- config ----------
-DEFAULT_TABLE_HINTS = ["ventas", "ventas_2025", "comparativo_emp._2024_vs_2025", "reporte", "hoja1"
+DEFAULT_TABLE_HINTS = [
+    "ventas_2025",                # ← PON ESTA PRIMERO
+    "comparativo_emp._2024_vs_2025",
+    "ventas", "reporte", "hoja1"
 ]
 
 # ---------- app ----------
@@ -1156,4 +1158,5 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
+
 
