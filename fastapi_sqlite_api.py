@@ -359,12 +359,16 @@ def schema():
 
 
 # ---------- RECARGA DESDE CSV (OneDrive) ----------
-@app.post("/refresh_db", summary="Forzar recarga de ventas2025.sqlite desde CSV_URL")
+@app.post("/refresh_db", summary="Forzar recarga de ventas2025.sqlite desde CSV_URL (simple)")
 def refresh_db():
     """
-    Descarga el CSV desde CSV_URL (env var) y reconstruye la tabla 'ventas_2025'
-    dentro de ventas2025.sqlite.
+    Versión simplificada:
+    - Lee CSV_URL (env var)
+    - Descarga el CSV
+    - Intenta leerlo primero con ';' y luego con ','
+    - Reemplaza la tabla ventas_2025
     """
+
     csv_url = os.getenv("CSV_URL")
     if not csv_url:
         raise HTTPException(
@@ -372,21 +376,26 @@ def refresh_db():
             detail="CSV_URL no está definido en variables de entorno."
         )
 
+    print(">>> /refresh_db: iniciando con CSV_URL =", csv_url, flush=True)
+
     try:
-        # --- 1) Descargar el archivo ---
+        # --- DESCARGA ---
         try:
-            resp = requests.get(csv_url, timeout=60)
+            resp = requests.get(csv_url, timeout=30)
         except Exception as e:
+            print(">>> ERROR conectando a CSV_URL:", repr(e), flush=True)
             raise HTTPException(
                 status_code=500,
                 detail=f"No se pudo conectar a CSV_URL: {e}"
             )
 
+        print(">>> /refresh_db: status descarga =", resp.status_code, flush=True)
+
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=500,
                 detail=f"No se pudo descargar el CSV (status {resp.status_code}). "
-                       f"Revisa que el enlace sea de descarga directa y público."
+                       "Revisa que el enlace sea público y de descarga directa."
             )
 
         content = resp.content
@@ -396,19 +405,27 @@ def refresh_db():
                 detail="El CSV descargado está vacío."
             )
 
-        # --- 2) Detectar separador ; o , ---
-        sample = content[:4096].decode("utf-8", errors="replace")
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-            sep = dialect.delimiter
-        except Exception:
-            sep = ";"
+        # --- LECTURA MUY SIMPLE ---
+        df = None
+        error_1 = None
 
-        # --- 3) Cargar en DataFrame ---
+        # Intento 1: separador ';'
         try:
-            df = pd.read_csv(io.BytesIO(content), sep=sep, engine="python")
-        except Exception:
-            df = pd.read_csv(io.BytesIO(content), sep=",", engine="python")
+            df = pd.read_csv(io.BytesIO(content), sep=";", engine="python")
+            print(">>> /refresh_db: leído con ';', filas =", len(df), flush=True)
+        except Exception as e:
+            error_1 = e
+            print(">>> /refresh_db: fallo con ';':", repr(e), flush=True)
+
+        # Si falló o df está vacío, intento con ','
+        if df is None or df.empty:
+            try:
+                df = pd.read_csv(io.BytesIO(content), sep=",", engine="python")
+                print(">>> /refresh_db: leído con ',', filas =", len(df), flush=True)
+            except Exception as e2:
+                print(">>> /refresh_db: fallo con ',' también:", repr(e2), flush=True)
+                msg = f"Error leyendo el CSV. Intento con ';': {error_1}, con ',': {e2}"
+                raise HTTPException(status_code=500, detail=msg)
 
         if df.empty:
             raise HTTPException(
@@ -416,21 +433,23 @@ def refresh_db():
                 detail="El CSV se leyó pero no contiene filas."
             )
 
-        # --- 4) Escribir/Actualizar SQLite ---
+        # --- ESCRITURA EN SQLITE ---
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        print(">>> /refresh_db: escribiendo DB en", DB_PATH, flush=True)
 
         with sqlite3.connect(str(DB_PATH)) as conn:
             df.to_sql("ventas_2025", conn, if_exists="replace", index=False)
 
-        # --- 5) Refrescar autodetección de tabla/columnas en memoria ---
+        print(">>> /refresh_db: tabla ventas_2025 reemplazada OK", flush=True)
+
+        # --- Refrescar autodetección en memoria (no crítico) ---
         global TABLA, COLS
         try:
             TABLA = pick_table()
             COLS = map_columns(TABLA)
-        except Exception:
-            # Si falla, igual la DB ya quedó actualizada;
-            # en el próximo deploy se recalculará.
-            pass
+            print(">>> /refresh_db: TABLA =", TABLA, "COLS =", COLS, flush=True)
+        except Exception as e:
+            print(">>> /refresh_db: error refrescando TABLA/COLS:", repr(e), flush=True)
 
         return {
             "status": "ok",
@@ -439,12 +458,12 @@ def refresh_db():
         }
 
     except HTTPException:
-        # Reenviamos errores HTTP ya controlados
+        # Errores HTTP ya controlados
         raise
     except Exception as e:
-        # Cualquier error inesperado lo registramos y devolvemos 500
+        # Error inesperado
         tb = traceback.format_exc()
-        print("ERROR en /refresh_db:", tb)
+        print(">>> ERROR inesperado en /refresh_db:\n", tb, flush=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error interno al refrescar DB: {e}"
@@ -476,7 +495,7 @@ def consulta_cliente(
     params: List = [desde, hasta]
 
     filtro_det = []
-    cliente_det = None
+    cliente_det = None    # noqa: F841
     cliente_id_det = None
 
     if identificacion:
