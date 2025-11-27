@@ -4,6 +4,8 @@ import sqlite3, re, unicodedata, os
 from typing import Dict, List, Optional, Literal, Tuple
 
 import io
+import csv
+import traceback
 import requests
 
 import pandas as pd
@@ -22,6 +24,7 @@ CSV_URL = os.getenv("CSV_URL")  # Link directo de descarga al CSV (termina en ?d
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "1") == "1"
 API_KEY = os.getenv("API_KEY")  # solo se usa si PUBLIC_MODE=False
 
+
 def require_auth(authorization: str = Header(None)):
     """
     Si PUBLIC_MODE es True => no exige auth.
@@ -29,13 +32,17 @@ def require_auth(authorization: str = Header(None)):
     """
     if PUBLIC_MODE:
         return
+
     if not API_KEY:
         return  # sin API_KEY definida, no se exige auth
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Falta Authorization: Bearer <token>")
+
     token = authorization.split(" ", 1)[1].strip()
     if token != API_KEY:
         raise HTTPException(403, "Token inválido")
+
 
 # ---------- config ----------
 DEFAULT_TABLE_HINTS = [
@@ -55,6 +62,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ---------- util db ----------
 def get_conn():
     if not DB_PATH.exists():
@@ -62,22 +70,27 @@ def get_conn():
     # Evitar bloqueos con Uvicorn
     return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
+
 def list_tables() -> List[str]:
     with get_conn() as conn:
         df = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1", conn)
     return df["name"].tolist()
 
+
 def normalize(s: str) -> str:
     s = str(s).lower()
     s = re.sub(r"[\s_]+", "", s)
-    s = (s.replace("á","a").replace("é","e").replace("í","i")
-           .replace("ó","o").replace("ú","u").replace("ñ","n"))
+    s = (s.replace("á", "a").replace("é", "e").replace("í", "i")
+           .replace("ó", "o").replace("ú", "u").replace("ñ", "n"))
     return s
 
+
 def strip_accents_spaces_lower(s: str) -> str:
-    if s is None: return ""
+    if s is None:
+        return ""
     s = unicodedata.normalize("NFKD", str(s))
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower().replace(" ", "")
+
 
 def pick_table() -> str:
     tabs = list_tables()
@@ -90,7 +103,8 @@ def pick_table() -> str:
             return normtabs[h]
     return tabs[0]
 
-def pick_fuzzy(norm_map: Dict[str,str], *cands) -> Optional[str]:
+
+def pick_fuzzy(norm_map: Dict[str, str], *cands) -> Optional[str]:
     for cand in cands:
         c = normalize(cand)
         for key, orig in norm_map.items():
@@ -98,13 +112,15 @@ def pick_fuzzy(norm_map: Dict[str,str], *cands) -> Optional[str]:
                 return orig
     return None
 
-def map_columns(tbl: str) -> Dict[str,str]:
+
+def map_columns(tbl: str) -> Dict[str, str]:
     with get_conn() as conn:
         info = pd.read_sql(f"PRAGMA table_info([{tbl}])", conn)
     names = info["name"].tolist()
     norm_map = {normalize(c): c for c in names}
 
-    m: Dict[str,str] = {}
+    m: Dict[str, str] = {}
+
     # Cliente (nombre)
     m["Cliente"] = (norm_map.get(normalize("Nombre cliente")) or
                     pick_fuzzy(norm_map, "nombre cliente", "cliente", "cliente/mes"))
@@ -112,7 +128,7 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Identificación
     m["Identificacion"] = (
         norm_map.get(normalize("Identificación")) or
-        norm_map.get(normalize("Identificacion"))  or
+        norm_map.get(normalize("Identificacion")) or
         pick_fuzzy(
             norm_map,
             "identificacion+suc", "identificacion", "nit", "nitcliente", "rut", "ruc",
@@ -149,14 +165,16 @@ def map_columns(tbl: str) -> Dict[str,str]:
     # Subtotal (monto)
     m["Subtotal"] = norm_map.get(normalize("Subtotal"))
 
-    missing = [k for k in ["Cliente","Fecha","Cantidad","Subtotal"] if not m.get(k)]
+    missing = [k for k in ["Cliente", "Fecha", "Cantidad", "Subtotal"] if not m.get(k)]
     if missing:
         raise HTTPException(400, f"Faltan columnas mínimas en [{tbl}]: {missing}. Revisa nombres.")
     return m
 
+
 # ---------- autodetección ----------
 TABLA = pick_table()
-COLS  = map_columns(TABLA)
+COLS = map_columns(TABLA)
+
 
 # ---------- helpers ----------
 def ensure_period(desde: str, hasta: str):
@@ -166,8 +184,10 @@ def ensure_period(desde: str, hasta: str):
     if desde > hasta:
         raise HTTPException(422, "El rango de fechas es inválido (desde > hasta).")
 
+
 def extract_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s))
+
 
 def parse_number_series(s: pd.Series) -> pd.Series:
     """
@@ -185,6 +205,7 @@ def parse_number_series(s: pd.Series) -> pd.Series:
     x2 = pd.concat([x_latam, x_onlyc, x_rest]).reindex(x.index)
     return pd.to_numeric(x2, errors="coerce").fillna(0.0)
 
+
 # --- Normalizaciones robustas para filtros de texto (SQL y Python) ---
 def sql_norm_column(col: str) -> str:
     """
@@ -201,19 +222,21 @@ def sql_norm_column(col: str) -> str:
     x = f"replace({x}, char(39), '')"  # '
     x = f"replace({x}, char(34), '')"  # "
     # acentos y eñes
-    for a,b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),
-                ("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),
-                ("ñ","n")]:
+    for a, b in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"),
+                 ("à", "a"), ("è", "e"), ("ì", "i"), ("ò", "o"), ("ù", "u"),
+                 ("ñ", "n")]:
         x = f"replace({x}, '{a}', '{b}')"
     return x
+
 
 def py_norm_text(s: str) -> str:
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
     s = re.sub(r"\s+", "", s)
     s = re.sub(r"[.,\\-\\/\\+_()'\"“”’]", "", s)
-    s = s.replace("\u00A0","")
+    s = s.replace("\u00A0", "")
     return s
+
 
 def add_text_filter(where: List[str], params: List[str], value: Optional[str], col: Optional[str]):
     if value and col:
@@ -222,10 +245,13 @@ def add_text_filter(where: List[str], params: List[str], value: Optional[str], c
         where.append(f"({norm_col} = ? OR {norm_col} LIKE ?)")
         params.extend([norm_val, f"%{norm_val}%"])
 
+
 # ---------- helpers SQL ----------
 def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional[List[str]] = None) -> Tuple[str, List]:
-    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
-    pro_col = COLS["Producto"]; grp_col = COLS.get("GrupoInventario")
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
+    pro_col = COLS["Producto"]
+    grp_col = COLS.get("GrupoInventario")
     cat_col = COLS.get("Categoria")
     qty_col = COLS["Cantidad"]
 
@@ -238,9 +264,11 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
     ]
     insert_pos = 2
     if grp_col:
-        sel.insert(insert_pos, f"[{grp_col}] AS GrupoInventario"); insert_pos += 1
+        sel.insert(insert_pos, f"[{grp_col}] AS GrupoInventario")
+        insert_pos += 1
     else:
-        sel.insert(insert_pos, "'N/A' AS GrupoInventario"); insert_pos += 1
+        sel.insert(insert_pos, "'N/A' AS GrupoInventario")
+        insert_pos += 1
     if cat_col:
         sel.insert(insert_pos, f"[{cat_col}] AS Categoria")
     else:
@@ -251,10 +279,12 @@ def build_base_select(val_col: str, extra_where: str = "", select_cols: Optional
     sql = f"SELECT {', '.join(sel)} FROM [{TABLA}] WHERE 1=1 {extra_where}"
     return sql, []
 
+
 # ---------- MODELOS ----------
 class TopItem(BaseModel):
     nombre: str
     valor: float
+
 
 class ResumenGrupo(BaseModel):
     grupo_inventario: str
@@ -267,6 +297,7 @@ class ResumenGrupo(BaseModel):
     top_productos: List[TopItem]
     mensual_ventas: Dict[str, float]
     mensual_unidades: Dict[str, float]
+
 
 class ResumenCliente(BaseModel):
     cliente: str
@@ -281,15 +312,17 @@ class ResumenCliente(BaseModel):
     mensual_ventas: Dict[str, float]
     mensual_unidades: Dict[str, float]
 
+
 class TopRespuesta(BaseModel):
-    entidad: Literal["clientes","productos"]
-    orden: Literal["mas","menos"]
-    frecuencia: Literal["mensual","anual"]
+    entidad: Literal["clientes", "productos"]
+    orden: Literal["mas", "menos"]
+    frecuencia: Literal["mensual", "anual"]
     desde: str
     hasta: str
     grupo_inventario: Optional[str] = None
     categoria: Optional[str] = None
     top: List[Dict[str, object]]
+
 
 # ---------- ROOT / HEALTH / METADATA ----------
 @app.get("/")
@@ -300,8 +333,9 @@ def home():
         "docs": "/docs",
         "health": "/health",
         "tabla": TABLA,
-        "public": PUBLIC_MODE
+        "public": PUBLIC_MODE,
     }
+
 
 @app.get("/health")
 def health():
@@ -311,9 +345,11 @@ def health():
         cnt = int(dfc.iloc[0]["n"])
     return {"ok": True, "public": PUBLIC_MODE, "db": str(DB_PATH), "tabla": TABLA, "cols": COLS, "rows_con_fecha": cnt}
 
+
 @app.get("/tablas")
 def tablas():
     return {"tablas": list_tables()}
+
 
 @app.get("/schema")
 def schema():
@@ -321,53 +357,107 @@ def schema():
         df = pd.read_sql(f"PRAGMA table_info([{TABLA}])", conn)
     return {"tabla": TABLA, "columns": df.to_dict(orient="records")}
 
+
 # ---------- RECARGA DESDE CSV (OneDrive) ----------
-@app.post("/refresh_db", dependencies=[Depends(require_auth)])
+@app.post("/refresh_db", summary="Forzar recarga de ventas2025.sqlite desde CSV_URL")
 def refresh_db():
     """
-    Recarga la tabla principal TABLA desde el CSV configurado en CSV_URL.
-    - Descarga el CSV de OneDrive.
-    - Reemplaza completamente la tabla TABLA en ventas2025.sqlite.
+    Descarga el CSV desde CSV_URL (env var) y reconstruye la tabla 'ventas_2025'
+    dentro de ventas2025.sqlite.
     """
-    if not CSV_URL:
-        raise HTTPException(500, "CSV_URL no está definido en variables de entorno.")
+    csv_url = os.getenv("CSV_URL")
+    if not csv_url:
+        raise HTTPException(
+            status_code=500,
+            detail="CSV_URL no está definido en variables de entorno."
+        )
 
     try:
-        resp = requests.get(CSV_URL)
-        resp.raise_for_status()
+        # --- 1) Descargar el archivo ---
+        try:
+            resp = requests.get(csv_url, timeout=60)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudo conectar a CSV_URL: {e}"
+            )
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudo descargar el CSV (status {resp.status_code}). "
+                       f"Revisa que el enlace sea de descarga directa y público."
+            )
+
+        content = resp.content
+        if not content:
+            raise HTTPException(
+                status_code=500,
+                detail="El CSV descargado está vacío."
+            )
+
+        # --- 2) Detectar separador ; o , ---
+        sample = content[:4096].decode("utf-8", errors="replace")
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+            sep = dialect.delimiter
+        except Exception:
+            sep = ";"
+
+        # --- 3) Cargar en DataFrame ---
+        try:
+            df = pd.read_csv(io.BytesIO(content), sep=sep, engine="python")
+        except Exception:
+            df = pd.read_csv(io.BytesIO(content), sep=",", engine="python")
+
+        if df.empty:
+            raise HTTPException(
+                status_code=500,
+                detail="El CSV se leyó pero no contiene filas."
+            )
+
+        # --- 4) Escribir/Actualizar SQLite ---
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            df.to_sql("ventas_2025", conn, if_exists="replace", index=False)
+
+        # --- 5) Refrescar autodetección de tabla/columnas en memoria ---
+        global TABLA, COLS
+        try:
+            TABLA = pick_table()
+            COLS = map_columns(TABLA)
+        except Exception:
+            # Si falla, igual la DB ya quedó actualizada;
+            # en el próximo deploy se recalculará.
+            pass
+
+        return {
+            "status": "ok",
+            "msg": "Base actualizada desde CSV_URL",
+            "filas": int(len(df)),
+        }
+
+    except HTTPException:
+        # Reenviamos errores HTTP ya controlados
+        raise
     except Exception as e:
-        raise HTTPException(500, f"No se pudo descargar el CSV: {e}")
+        # Cualquier error inesperado lo registramos y devolvemos 500
+        tb = traceback.format_exc()
+        print("ERROR en /refresh_db:", tb)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno al refrescar DB: {e}"
+        )
 
-    # Intentar leer el CSV (asumiendo delimitador ';' como en tus archivos)
-    try:
-        contenido = resp.content.decode("utf-8", errors="ignore")
-        df = pd.read_csv(io.StringIO(contenido), sep=";")
-    except Exception as e:
-        raise HTTPException(500, f"No se pudo leer el CSV: {e}")
-
-    if df.empty:
-        raise HTTPException(400, "El CSV no contiene filas.")
-
-    # Reemplazar la tabla principal que la API está usando (TABLA)
-    try:
-        with get_conn() as conn:
-            df.to_sql(TABLA, conn, if_exists="replace", index=False)
-    except Exception as e:
-        raise HTTPException(500, f"No se pudo actualizar la tabla {TABLA}: {e}")
-
-    return {
-        "ok": True,
-        "mensaje": f"Tabla {TABLA} recargada desde CSV.",
-        "filas": int(len(df))
-    }
 
 # ---------- consulta cliente (solo SUBTOTAL) ----------
 @app.get("/consulta_cliente", response_model=ResumenCliente, dependencies=[Depends(require_auth)])
 def consulta_cliente(
     cliente: Optional[str] = Query(None, min_length=2, description="Nombre o parte del nombre"),
     identificacion: Optional[str] = Query(None, description="Identificación exacta o parcial (solo números serán usados)"),
-    desde: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     grupo_inventario: Optional[str] = Query(None, description="Filtra por grupo de inventario (opcional)"),
     categoria: Optional[str] = Query(None, description="Filtra por categoría (opcional)")
 ):
@@ -376,10 +466,11 @@ def consulta_cliente(
     if not val_col:
         raise HTTPException(500, "No existe columna Subtotal en la base. Corrige la estructura.")
 
-    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
     grp_col = COLS.get("GrupoInventario")
     cat_col = COLS.get("Categoria")
-    id_col  = COLS.get("Identificacion")
+    id_col = COLS.get("Identificacion")
 
     where = ["date([" + fec_col + "]) BETWEEN ? AND ?"]
     params: List = [desde, hasta]
@@ -456,8 +547,8 @@ def consulta_cliente(
         df = df[df["Cliente"] == cliente_det].copy()
 
     total_unidades = float(df["Cantidad"].sum())
-    total_valor    = float(df["Subtotal"].sum())
-    ticket_prom    = float(total_valor / total_unidades) if total_unidades else 0.0
+    total_valor = float(df["Subtotal"].sum())
+    ticket_prom = float(total_valor / total_unidades) if total_unidades else 0.0
 
     por_grupo = (
         df.groupby("GrupoInventario", dropna=False)["Subtotal"]
@@ -489,18 +580,19 @@ def consulta_cliente(
         total_unidades=round(total_unidades, 2),
         total_valor_subtotal=round(total_valor, 2),
         ticket_promedio=round(ticket_prom, 2),
-        ventas_por_grupo={ (k if k is not None else "N/A"): float(v) for k,v in por_grupo.items() },
+        ventas_por_grupo={(k if k is not None else "N/A"): float(v) for k, v in por_grupo.items()},
         top_productos=top_list,
         mensual_ventas={k: float(v) for k, v in mens_val.items()},
-        mensual_unidades={k: float(v) for k, v in mens_qty.items()}
+        mensual_unidades={k: float(v) for k, v in mens_qty.items()},
     )
+
 
 # ---------- consulta por GRUPO DE INVENTARIO ----------
 @app.get("/consulta_grupo", response_model=ResumenGrupo, dependencies=[Depends(require_auth)])
 def consulta_grupo(
     grupo_inventario: str = Query(..., min_length=2, description="Nombre o parte del grupo de inventario"),
-    desde: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: str   = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     categoria: Optional[str] = Query(None, description="Filtra por categoría (opcional)")
 ):
     """
@@ -571,8 +663,8 @@ def consulta_grupo(
 
     # Totales
     total_unidades = float(df["Cantidad"].sum())
-    total_valor    = float(df["Subtotal"].sum())
-    ticket_prom    = float(total_valor / total_unidades) if total_unidades else 0.0
+    total_valor = float(df["Subtotal"].sum())
+    ticket_prom = float(total_valor / total_unidades) if total_unidades else 0.0
 
     # Ventas por cliente
     ventas_cli = (
@@ -606,11 +698,12 @@ def consulta_grupo(
         total_unidades=round(total_unidades, 2),
         total_valor_subtotal=round(total_valor, 2),
         ticket_promedio=round(ticket_prom, 2),
-        ventas_por_cliente={ (k if k is not None else "N/A"): float(v) for k,v in ventas_cli.items() },
+        ventas_por_cliente={(k if k is not None else "N/A"): float(v) for k, v in ventas_cli.items()},
         top_productos=top_list,
         mensual_ventas={k: float(v) for k, v in mens_val.items()},
-        mensual_unidades={k: float(v) for k, v in mens_qty.items()}
+        mensual_unidades={k: float(v) for k, v in mens_qty.items()},
     )
+
 
 # ---------- informe (texto) ----------
 @app.get("/informe_cliente", dependencies=[Depends(require_auth)])
@@ -629,7 +722,7 @@ def informe_cliente(
             desde=desde,
             hasta=hasta,
             grupo_inventario=grupo_inventario,
-            categoria=categoria
+            categoria=categoria,
         )
     except HTTPException as e:
         if e.status_code == 404:
@@ -637,7 +730,7 @@ def informe_cliente(
             return {"informe": f"No encontré ventas para '{target}' en {desde} → {hasta}."}
         raise
 
-    lineas = [ "🧾 Informe de cliente" ]
+    lineas = ["🧾 Informe de cliente"]
     if r.cliente_id:
         lineas.append(f"Cliente: {r.cliente} (ID: {r.cliente_id})")
     else:
@@ -652,7 +745,7 @@ def informe_cliente(
         f"Ventas (Subtotal): ${r.total_valor_subtotal:,.2f}",
         f"Ticket promedio: ${r.ticket_promedio:,.2f}",
         "",
-        "Ventas por grupo (Top):"
+        "Ventas por grupo (Top):",
     ]
     port = sorted(r.ventas_por_grupo.items(), key=lambda x: x[1], reverse=True)
     for k, v in port[:10]:
@@ -670,24 +763,26 @@ def informe_cliente(
 
     return {"informe": "\n".join(lineas)}
 
+
 # ---------- TOPS globales ----------
 @app.get("/tops", response_model=TopRespuesta, dependencies=[Depends(require_auth)])
 def tops(
-    entidad: Literal["clientes","productos"] = Query(..., description="Entidad objetivo del top"),
-    orden: Literal["mas","menos"] = Query("mas", description="‘mas’ o ‘menos’"),
-    frecuencia: Literal["mensual","anual"] = Query("anual"),
+    entidad: Literal["clientes", "productos"] = Query(..., description="Entidad objetivo del top"),
+    orden: Literal["mas", "menos"] = Query("mas", description="‘mas’ o ‘menos’"),
+    frecuencia: Literal["mensual", "anual"] = Query("anual"),
     desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
     grupo_inventario: Optional[str] = Query(None, description="Filtro opcional por grupo de inventario"),
     categoria: Optional[str] = Query(None, description="Filtro opcional por categoría"),
-    limite: int = Query(10, ge=1, le=100)
+    limite: int = Query(10, ge=1, le=100),
 ):
     ensure_period(desde, hasta)
     val_col = COLS.get("Subtotal")
     if not val_col:
         raise HTTPException(500, "No existe columna Subtotal en la base.")
 
-    cli_col = COLS["Cliente"]; fec_col = COLS["Fecha"]
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
     grp_col = COLS.get("GrupoInventario")
     cat_col = COLS.get("Categoria")
     pro_col = COLS["Producto"]
@@ -697,7 +792,7 @@ def tops(
 
     # Filtros robustos por grupo/categoría
     add_text_filter(where, params, grupo_inventario, grp_col)
-    add_text_filter(where, params, categoria,        cat_col)
+    add_text_filter(where, params, categoria, cat_col)
 
     target_col = f"[{cli_col}]" if entidad == "clientes" else f"[{pro_col}]"
 
@@ -726,27 +821,32 @@ def tops(
 
     if frecuencia == "mensual":
         df["Periodo"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m")
-        g = df.groupby(["Periodo","Nombre"], dropna=False)["Subtotal"].sum().reset_index()
+        g = df.groupby(["Periodo", "Nombre"], dropna=False)["Subtotal"].sum().reset_index()
         resultado: List[Dict[str, object]] = []
         for periodo, chunk in g.groupby("Periodo"):
             chunk = chunk.sort_values("Subtotal", ascending=(orden == "menos"))
             head = chunk.head(limite)
             for _, r in head.iterrows():
-                resultado.append({"periodo": periodo, "nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))})
+                resultado.append({"periodo": periodo, "nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"], 2))})
     else:
         g = df.groupby("Nombre", dropna=False)["Subtotal"].sum().reset_index()
         g = g.sort_values("Subtotal", ascending=(orden == "menos")).head(limite)
-        resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"],2))} for _, r in g.iterrows()]
+        resultado = [{"nombre": str(r["Nombre"]), "valor": float(round(r["Subtotal"], 2))} for _, r in g.iterrows()]
 
     return TopRespuesta(
-        entidad=entidad, orden=orden, frecuencia=frecuencia,
-        desde=desde, hasta=hasta,
-        grupo_inventario=grupo_inventario, categoria=categoria,
-        top=resultado
+        entidad=entidad,
+        orden=orden,
+        frecuencia=frecuencia,
+        desde=desde,
+        hasta=hasta,
+        grupo_inventario=grupo_inventario,
+        categoria=categoria,
+        top=resultado,
     )
 
+
 # ---------- Series (MENSUAL / ANUAL) LIMPIAS ----------
-def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tuple[str,str]:
+def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tuple[str, str]:
     """
     Si no envían desde/hasta, usa todo el rango disponible en la base (por fecha).
     """
@@ -757,10 +857,14 @@ def _ensure_period_or_default(desde: Optional[str], hasta: Optional[str]) -> Tup
     d2 = str(r["d2"]) if pd.notna(r["d2"]) else "2100-12-31"
     return (desde or d1, hasta or d2)
 
-def _build_sales_df(desde: str, hasta: str,
-                    grupo_inventario: Optional[str],
-                    categoria: Optional[str],
-                    producto: Optional[str]) -> pd.DataFrame:
+
+def _build_sales_df(
+    desde: str,
+    hasta: str,
+    grupo_inventario: Optional[str],
+    categoria: Optional[str],
+    producto: Optional[str],
+) -> pd.DataFrame:
     """
     Devuelve un DataFrame con: Fecha, Subtotal, GrupoInventario, Categoria, Producto
     y aplica filtros robustos si se piden.
@@ -785,8 +889,8 @@ def _build_sales_df(desde: str, hasta: str,
             params.append(f"%{norm_val}%")
 
     add_like(grupo_inventario, grp_col)
-    add_like(categoria,        cat_col)
-    add_like(producto,         pro_col)
+    add_like(categoria, cat_col)
+    add_like(producto, pro_col)
 
     sql = f"""
       SELECT [{fec_col}] AS Fecha,
@@ -814,13 +918,14 @@ def _build_sales_df(desde: str, hasta: str,
     df = df.dropna(subset=["Fecha"])
     return df
 
+
 @app.get("/ventas_mensuales_vista", dependencies=[Depends(require_auth)])
 def ventas_mensuales_vista(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     grupo_inventario: Optional[str] = Query(None),
     categoria: Optional[str] = Query(None),
-    producto: Optional[str] = Query(None)
+    producto: Optional[str] = Query(None),
 ):
     d, h = _ensure_period_or_default(desde, hasta)
     ensure_period(d, h)
@@ -831,20 +936,24 @@ def ventas_mensuales_vista(
 
     return {
         "ok": True,
-        "filtros": {"desde": d, "hasta": h,
-                    "grupo_inventario": grupo_inventario,
-                    "categoria": categoria,
-                    "producto": producto},
-        "ventas_mensuales": [{"Mes": k, "Total": float(round(v,2))} for k, v in mens.items()]
+        "filtros": {
+            "desde": d,
+            "hasta": h,
+            "grupo_inventario": grupo_inventario,
+            "categoria": categoria,
+            "producto": producto,
+        },
+        "ventas_mensuales": [{"Mes": k, "Total": float(round(v, 2))} for k, v in mens.items()],
     }
+
 
 @app.get("/ventas_anuales_vista", dependencies=[Depends(require_auth)])
 def ventas_anuales_vista(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     grupo_inventario: Optional[str] = Query(None),
-    categoria:        Optional[str] = Query(None),
-    producto:         Optional[str] = Query(None)
+    categoria: Optional[str] = Query(None),
+    producto: Optional[str] = Query(None),
 ):
     d, h = _ensure_period_or_default(desde, hasta)
     ensure_period(d, h)
@@ -855,12 +964,16 @@ def ventas_anuales_vista(
 
     return {
         "ok": True,
-        "filtros": {"desde": d, "hasta": h,
-                    "grupo_inventario": grupo_inventario,
-                    "categoria": categoria,
-                    "producto": producto},
-        "ventas_anuales": [{"Anio": k, "Total": float(round(v,2))} for k, v in anual.items()]
+        "filtros": {
+            "desde": d,
+            "hasta": h,
+            "grupo_inventario": grupo_inventario,
+            "categoria": categoria,
+            "producto": producto,
+        },
+        "ventas_anuales": [{"Anio": k, "Total": float(round(v, 2))} for k, v in anual.items()],
     }
+
 
 # --------- ALIAS explícitos (útiles para Actions / agentes) ----------
 @app.get("/ventas_mensuales_por_grupo", dependencies=[Depends(require_auth)])
@@ -878,6 +991,7 @@ def ventas_mensuales_por_grupo(
                                   grupo_inventario=gi,
                                   categoria=None, producto=None)
 
+
 @app.get("/ventas_mensuales_por_categoria", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_categoria(
     categoria: Optional[str] = Query(None, alias="categoria"),
@@ -892,10 +1006,11 @@ def ventas_mensuales_por_categoria(
                                   grupo_inventario=None,
                                   categoria=cat, producto=None)
 
+
 @app.get("/ventas_mensuales_por_producto", dependencies=[Depends(require_auth)])
 def ventas_mensuales_por_producto(
     producto: Optional[str] = Query(None, alias="producto"),
-    product: Optional[str]  = Query(None, alias="product"),
+    product: Optional[str] = Query(None, alias="product"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
@@ -905,6 +1020,7 @@ def ventas_mensuales_por_producto(
     return ventas_mensuales_vista(desde=desde, hasta=hasta,
                                   grupo_inventario=None,
                                   categoria=None, producto=prod)
+
 
 @app.get("/ventas_anuales_por_grupo", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_grupo(
@@ -920,6 +1036,7 @@ def ventas_anuales_por_grupo(
                                 grupo_inventario=gi,
                                 categoria=None, producto=None)
 
+
 @app.get("/ventas_anuales_por_categoria", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_categoria(
     categoria: Optional[str] = Query(None, alias="categoria"),
@@ -934,10 +1051,11 @@ def ventas_anuales_por_categoria(
                                 grupo_inventario=None,
                                 categoria=cat, producto=None)
 
+
 @app.get("/ventas_anuales_por_producto", dependencies=[Depends(require_auth)])
 def ventas_anuales_por_producto(
     producto: Optional[str] = Query(None, alias="producto"),
-    product: Optional[str]  = Query(None, alias="product"),
+    product: Optional[str] = Query(None, alias="product"),
     desde: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
     hasta: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$"),
 ):
@@ -947,6 +1065,7 @@ def ventas_anuales_por_producto(
     return ventas_anuales_vista(desde=desde, hasta=hasta,
                                 grupo_inventario=None,
                                 categoria=None, producto=prod)
+
 
 # ---------- Descubrimiento de valores (para evitar "nombre exacto") ----------
 def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
@@ -973,6 +1092,7 @@ def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
     except Exception as e:
         raise HTTPException(400, f"Consulta inválida en valores/{col_real}: {e}")
 
+
 @app.get("/valores/grupos", dependencies=[Depends(require_auth)])
 def valores_grupos(contiene: Optional[str] = None, limite: int = 200):
     col = COLS.get("GrupoInventario")
@@ -980,12 +1100,14 @@ def valores_grupos(contiene: Optional[str] = None, limite: int = 200):
         raise HTTPException(400, "No existe columna de GrupoInventario en la base.")
     return _listar_unicos(col, contiene, limite)
 
+
 @app.get("/valores/categorias", dependencies=[Depends(require_auth)])
 def valores_categorias(contiene: Optional[str] = None, limite: int = 200):
     col = COLS.get("Categoria")
     if not col:
         raise HTTPException(400, "No existe columna de Categoría en la base.")
     return _listar_unicos(col, contiene, limite)
+
 
 @app.get("/valores/productos", dependencies=[Depends(require_auth)])
 def valores_productos(contiene: Optional[str] = None, limite: int = 200):
