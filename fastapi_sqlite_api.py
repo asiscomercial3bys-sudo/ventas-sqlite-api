@@ -385,6 +385,9 @@ def refresh_db():
     """
     Descarga el CSV desde CSV_URL (env var) y reconstruye la tabla 'ventas_2025'
     dentro de ventas2025.sqlite, leyendo por chunks para evitar problemas de memoria.
+
+    IMPORTANTE: Cada vez que se ejecuta, se BORRA la tabla ventas_2025 y se vuelve
+    a llenar desde cero, así que no se pueden acumular duplicados por recargas.
     """
     csv_url = os.getenv("CSV_URL")
     if not csv_url:
@@ -417,8 +420,12 @@ def refresh_db():
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
         total_rows = 0
-        first = True
         with sqlite3.connect(str(DB_PATH)) as conn:
+            # 🔥 BORRAR la tabla antes de recargar para evitar duplicados
+            conn.execute("DROP TABLE IF EXISTS ventas_2025")
+            conn.commit()
+
+            # Leer el CSV por chunks y hacer append sobre la tabla limpia
             for chunk in pd.read_csv(
                 io.BytesIO(content),
                 sep=sep,
@@ -428,11 +435,10 @@ def refresh_db():
                 chunk.to_sql(
                     "ventas_2025",
                     conn,
-                    if_exists="replace" if first else "append",
+                    if_exists="append",   # siempre append porque ya la borramos antes
                     index=False
                 )
                 total_rows += len(chunk)
-                first = False
 
         # Refrescar autodetección de tabla/columnas
         global TABLA, COLS
@@ -441,7 +447,7 @@ def refresh_db():
 
         return {
             "status": "ok",
-            "msg": "Base actualizada desde CSV_URL (lectura por chunks)",
+            "msg": "Base actualizada desde CSV_URL (lectura por chunks, tabla reemplazada)",
             "filas": int(total_rows)
         }
 
@@ -1158,7 +1164,3 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
-
-
-
-
