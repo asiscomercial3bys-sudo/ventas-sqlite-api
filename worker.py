@@ -5,36 +5,34 @@ import pytz
 
 API_URL = "https://ventas-sqlite-api.onrender.com/refresh_db"
 TZ = pytz.timezone("America/Bogota")
-HORA_EJECUCION = 3
+HORA_EJECUCION = 3  # 3:00 AM
 
 def refrescar():
     ahora = datetime.datetime.now(TZ)
-    print(f"[{ahora}] Ejecutando POST a: {API_URL}")
+    print(f"\n🔄 EXEC → Ejecutando POST a {API_URL} — {ahora}")
 
     try:
         r = requests.post(API_URL, timeout=300)
-        print(f"[{ahora}] STATUS {r.status_code}")
-        print("Respuesta del servidor:")
-        print(r.text[:500])  # solo primeros 500 caracteres
+        print(f"📌 STATUS: {r.status_code}")
+        print(f"📄 RESPUESTA (primeros 400 chars):\n{r.text[:400]}")
     except Exception as e:
-        print(f"[{ahora}] ERROR al llamar refresh_db: {e}")
+        print(f"❌ ERROR ejecutando refresh_db:\n{e}")
 
-
-def segundos_hasta_proxima_ejecucion():
+def segundos_para_las_3am():
     ahora = datetime.datetime.now(TZ)
-    proximo = ahora.replace(hour=HORA_EJECUCION, minute=0, second=0, microsecond=0)
+    run = ahora.replace(hour=HORA_EJECUCION, minute=0, second=0, microsecond=0)
 
-    if ahora >= proximo:
-        proximo += datetime.timedelta(days=1)
+    if ahora >= run:
+        run += datetime.timedelta(days=1)
 
-    diff = (proximo - ahora).total_seconds()
-    print(f"Próxima ejecución a las 3 AM: {proximo} (en {diff} seg)")
+    diff = int((run - ahora).total_seconds())
+    print(f"⏳ Próxima ejecución programada: {run} (en {diff} segundos)")
     return diff
 
 
 if __name__ == "__main__":
-    refrescar()
+    refrescar()  # se ejecuta al iniciar el worker
 
     while True:
-        time.sleep(segundos_hasta_proxima_ejecucion())
+        time.sleep(segundos_para_las_3am())
         refrescar()
