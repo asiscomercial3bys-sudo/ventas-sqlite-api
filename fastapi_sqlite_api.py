@@ -473,8 +473,8 @@ def consulta_cliente(
     identificacion: Optional[str] = Query(
         None, description="Identificación exacta o parcial (solo números serán usados)"
     ),
-    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d2$".replace("-\d2", "-\d{2}")),
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d2$".replace("-\d2", "-\d{2}")),
     grupo_inventario: Optional[str] = Query(
         None, description="Filtra por grupo de inventario (opcional)"
     ),
@@ -655,8 +655,6 @@ def consulta_grupo(
     cli_col = COLS["Cliente"]
     fec_col = COLS["Fecha"]
     cat_col = COLS.get("Categoria")
-    pro_col = COLS["Producto"]
-    qty_col = COLS["Cantidad"]
 
     where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
     params: List = [desde, hasta]
@@ -697,6 +695,11 @@ def consulta_grupo(
     df["Fecha"] = parse_fecha_series(df["Fecha"])
     df = df.dropna(subset=["Fecha"])
 
+    # Asegurar que exista y sea texto la columna Categoria
+    if "Categoria" not in df.columns:
+        df["Categoria"] = "N/A"
+    df["Categoria"] = df["Categoria"].fillna("N/A").astype(str)
+
     # Determinar el grupo REAL dominante (por si el filtro fue parcial)
     if "GrupoInventario" in df.columns:
         grupo_real = df["GrupoInventario"].value_counts().idxmax()
@@ -720,8 +723,8 @@ def consulta_grupo(
         df.groupby("Categoria", dropna=False)["Subtotal"]
           .sum().sort_values(ascending=False).round(2).to_dict()
     )
-    ventas_cat = {(k if k is not None else "N/A"): float(v)
-                  for k, v in ventas_cat.items()}
+    ventas_cat = { (k if k is not None else "N/A"): float(v)
+                   for k, v in ventas_cat.items() }
 
     # Top productos
     top_prod_df = (
@@ -757,7 +760,6 @@ def consulta_grupo(
         mensual_cat[cat_key][periodo] = valor
 
     # Comparativo anual del grupo (todos los años disponibles)
-    # Reutilizamos helpers globales para traer TODO el histórico del grupo
     d_all, h_all = _ensure_period_or_default(None, None)
     df_hist = _build_sales_df(d_all, h_all, grupo_real, None, None)
     df_hist["Anio"] = df_hist["Fecha"].dt.year.astype(str)
