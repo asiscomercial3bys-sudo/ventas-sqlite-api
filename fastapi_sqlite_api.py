@@ -308,9 +308,12 @@ class ResumenGrupo(BaseModel):
     total_valor_subtotal: float
     ticket_promedio: float
     ventas_por_cliente: Dict[str, float]
+    ventas_por_categoria: Dict[str, float]
     top_productos: List[TopItem]
     mensual_ventas: Dict[str, float]
     mensual_unidades: Dict[str, float]
+    mensual_ventas_por_categoria: Dict[str, Dict[str, float]]
+    comparativo_anual: Dict[str, float]
 
 
 class ResumenCliente(BaseModel):
@@ -635,8 +638,11 @@ def consulta_grupo(
     - Total unidades y valor
     - Ticket promedio (valor / unidades)
     - Ventas por cliente
+    - Ventas por categoría
     - Top productos
     - Serie mensual (unidades y valor)
+    - Serie mensual por categoría
+    - Comparativo anual del mismo grupo (todos los años disponibles)
     """
     ensure_period(desde, hasta)
     val_col = COLS.get("Subtotal")
@@ -709,6 +715,14 @@ def consulta_grupo(
           .sum().sort_values(ascending=False).round(2).to_dict()
     )
 
+    # Ventas por categoría
+    ventas_cat = (
+        df.groupby("Categoria", dropna=False)["Subtotal"]
+          .sum().sort_values(ascending=False).round(2).to_dict()
+    )
+    ventas_cat = {(k if k is not None else "N/A"): float(v)
+                  for k, v in ventas_cat.items()}
+
     # Top productos
     top_prod_df = (
         df.groupby("Producto", dropna=False)["Subtotal"]
@@ -722,10 +736,36 @@ def consulta_grupo(
         ) for _, r in top_prod_df.iterrows()
     ]
 
-    # Series mensuales
+    # Series mensuales generales
     df["YYYYMM"] = df["Fecha"].dt.strftime("%Y-%m")
     mens_val = df.groupby("YYYYMM", dropna=False)["Subtotal"].sum().round(2).to_dict()
     mens_qty = df.groupby("YYYYMM", dropna=False)["Cantidad"].sum().round(2).to_dict()
+
+    # Serie mensual por categoría
+    mens_cat_df = (
+        df.groupby(["Categoria", "YYYYMM"], dropna=False)["Subtotal"]
+          .sum().reset_index()
+    )
+    mensual_cat: Dict[str, Dict[str, float]] = {}
+    for _, r in mens_cat_df.iterrows():
+        cat = r["Categoria"]
+        cat_key = "N/A" if pd.isna(cat) else str(cat)
+        periodo = str(r["YYYYMM"])
+        valor = float(round(r["Subtotal"], 2))
+        if cat_key not in mensual_cat:
+            mensual_cat[cat_key] = {}
+        mensual_cat[cat_key][periodo] = valor
+
+    # Comparativo anual del grupo (todos los años disponibles)
+    # Reutilizamos helpers globales para traer TODO el histórico del grupo
+    d_all, h_all = _ensure_period_or_default(None, None)
+    df_hist = _build_sales_df(d_all, h_all, grupo_real, None, None)
+    df_hist["Anio"] = df_hist["Fecha"].dt.year.astype(str)
+    comp_anual = (
+        df_hist.groupby("Anio", dropna=False)["Subtotal"]
+               .sum().round(2).to_dict()
+    )
+    comp_anual = {str(k): float(v) for k, v in comp_anual.items()}
 
     return ResumenGrupo(
         grupo_inventario=str(grupo_real),
@@ -736,9 +776,12 @@ def consulta_grupo(
         ticket_promedio=round(ticket_prom, 2),
         ventas_por_cliente={ (k if k is not None else "N/A"): float(v)
                              for k, v in ventas_cli.items() },
+        ventas_por_categoria=ventas_cat,
         top_productos=top_list,
         mensual_ventas={k: float(v) for k, v in mens_val.items()},
-        mensual_unidades={k: float(v) for k, v in mens_qty.items()}
+        mensual_unidades={k: float(v) for k, v in mens_qty.items()},
+        mensual_ventas_por_categoria=mensual_cat,
+        comparativo_anual=comp_anual
     )
 
 
