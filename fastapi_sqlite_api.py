@@ -174,7 +174,6 @@ def map_columns(tbl: str) -> Dict[str, str]:
         raise HTTPException(400, f"Faltan columnas mínimas en [{tbl}]: {missing}. Revisa nombres.")
     return m
 
-
 # ---------- autodetección ----------
 TABLA = pick_table()
 COLS = map_columns(TABLA)
@@ -217,7 +216,6 @@ def parse_fecha_series(s: pd.Series) -> pd.Series:
     """
     return pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
 
-
 # --- Normalizaciones robustas para filtros de texto (SQL y Python) ---
 
 def sql_norm_column(col: str) -> str:
@@ -256,7 +254,6 @@ def add_text_filter(where: List[str], params: List[str],
         where.append(f"({norm_col} = ? OR {norm_col} LIKE ?)")
         params.extend([norm_val, f"%{norm_val}%"])
 
-
 # ---------- helpers SQL ----------
 
 def build_base_select(val_col: str, extra_where: str = "",
@@ -291,7 +288,6 @@ def build_base_select(val_col: str, extra_where: str = "",
         sel = select_cols
     sql = f"SELECT {', '.join(sel)} FROM [{TABLA}] WHERE 1=1 {extra_where}"
     return sql, []
-
 
 # ---------- MODELOS ----------
 
@@ -340,7 +336,6 @@ class TopRespuesta(BaseModel):
     categoria: Optional[str] = None
     top: List[Dict[str, object]]
 
-
 # ---------- ROOT / HEALTH / METADATA ----------
 
 @app.get("/")
@@ -379,7 +374,6 @@ def schema():
     with get_conn() as conn:
         df = pd.read_sql(f"PRAGMA table_info([{TABLA}])", conn)
     return {"tabla": TABLA, "columns": df.to_dict(orient="records")}
-
 
 # ---------- RECARGA DESDE CSV (OneDrive) ----------
 
@@ -460,7 +454,6 @@ def refresh_db():
         tb = traceback.format_exc()
         print("ERROR en /refresh_db:", tb)
         raise HTTPException(500, f"Error interno al refrescar DB: {e}")
-
 
 # ---------- consulta cliente (solo SUBTOTAL) ----------
 
@@ -618,7 +611,6 @@ def consulta_cliente(
         mensual_ventas={k: float(v) for k, v in mens_val.items()},
         mensual_unidades={k: float(v) for k, v in mens_qty.items()}
     )
-
 
 # ---------- consulta por GRUPO DE INVENTARIO ----------
 
@@ -786,7 +778,6 @@ def consulta_grupo(
         comparativo_anual=comp_anual
     )
 
-
 # ---------- informe (texto) ----------
 
 @app.get("/informe_cliente", dependencies=[Depends(require_auth)])
@@ -845,7 +836,6 @@ def informe_cliente(
         lineas.append(f"  {m}: ${v:,.2f}")
 
     return {"informe": "\n".join(lineas)}
-
 
 # ---------- TOPS globales ----------
 
@@ -940,7 +930,6 @@ def tops(
         grupo_inventario=grupo_inventario, categoria=categoria,
         top=resultado
     )
-
 
 # ---------- Series (MENSUAL / ANUAL) LIMPIAS ----------
 
@@ -1067,7 +1056,6 @@ def ventas_anuales_vista(
                            for k, v in anual.items()]
     }
 
-
 # --------- ALIAS explícitos (útiles para Actions / agentes) ----------
 
 @app.get("/ventas_mensuales_por_grupo", dependencies=[Depends(require_auth)])
@@ -1159,7 +1147,6 @@ def ventas_anuales_por_producto(
                                 grupo_inventario=None,
                                 categoria=None, producto=prod)
 
-
 # ---------- Descubrimiento de valores (para evitar "nombre exacto") ----------
 
 def _listar_unicos(col_real: str, contiene: Optional[str], limite: int = 200):
@@ -1209,3 +1196,99 @@ def valores_productos(contiene: Optional[str] = None, limite: int = 200):
     if not col:
         raise HTTPException(400, "No existe columna de Producto en la base.")
     return _listar_unicos(col, contiene, limite)
+
+
+# ========== NUEVO ENDPOINT: VENTAS CONSOLIDADAS POR CLIENTE (SIN LÍMITE FIJO) ==========
+
+@app.get("/ventas_por_cliente_consolidadas", dependencies=[Depends(require_auth)])
+def ventas_por_cliente_consolidadas(
+    desde: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
+    grupo_inventario: Optional[str] = Query(
+        None, description="Filtro opcional por grupo de inventario (ej: PROKPIL)"
+    ),
+    categoria: Optional[str] = Query(
+        None, description="Filtro opcional por categoría"
+    ),
+    limite: Optional[int] = Query(
+        None, ge=1, le=10000,
+        description="Opcional: limitar cantidad de clientes devueltos"
+    )
+):
+    """
+    Devuelve ventas consolidadas por cliente (Subtotal y Unidades),
+    opcionalmente filtradas por grupo_inventario y/o categoría.
+
+    Útil para clasificar clientes en Tipo A, B, C por su aporte al total.
+    """
+    ensure_period(desde, hasta)
+
+    val_col = COLS.get("Subtotal")
+    if not val_col:
+        raise HTTPException(500, "No existe columna Subtotal en la base.")
+    cli_col = COLS["Cliente"]
+    fec_col = COLS["Fecha"]
+    qty_col = COLS["Cantidad"]
+    grp_col = COLS.get("GrupoInventario")
+    cat_col = COLS.get("Categoria")
+
+    where = [f"date([{fec_col}]) BETWEEN ? AND ?"]
+    params: List[str] = [desde, hasta]
+
+    # Filtros robustos
+    add_text_filter(where, params, grupo_inventario, grp_col)
+    add_text_filter(where, params, categoria, cat_col)
+
+    sql = f"""
+        SELECT
+            [{cli_col}]  AS Cliente,
+            [{val_col}]  AS Subtotal,
+            [{qty_col}]  AS Cantidad,
+            [{fec_col}]  AS Fecha
+        FROM [{TABLA}]
+        WHERE {" AND ".join(where)}
+    """
+
+    with get_conn() as conn:
+        df = pd.read_sql(sql, conn, params=params)
+
+    if df.empty:
+        raise HTTPException(404, "No hay registros para el filtro/periodo indicado.")
+
+    df["Subtotal"] = parse_number_series(df["Subtotal"])
+    df["Cantidad"] = parse_number_series(df["Cantidad"])
+    if df["Subtotal"].sum() == 0:
+        raise HTTPException(404, "No hay valores en 'Subtotal' para el filtro/periodo indicado.")
+
+    df["Cliente"] = df["Cliente"].fillna("N/A")
+
+    # Agregar por cliente
+    agg = (
+        df.groupby("Cliente", dropna=False)[["Subtotal", "Cantidad"]]
+          .sum()
+          .reset_index()
+    )
+    agg = agg.sort_values("Subtotal", ascending=False)
+
+    if limite is not None:
+        agg = agg.head(limite)
+
+    clientes = [
+        {
+            "cliente": str(r["Cliente"]),
+            "total_subtotal": float(round(r["Subtotal"], 2)),
+            "total_unidades": float(round(r["Cantidad"], 2))
+        }
+        for _, r in agg.iterrows()
+    ]
+
+    total_general = float(round(df["Subtotal"].sum(), 2))
+
+    return {
+        "desde": desde,
+        "hasta": hasta,
+        "grupo_inventario": grupo_inventario,
+        "categoria": categoria,
+        "total_general_subtotal": total_general,
+        "clientes": clientes
+    }
