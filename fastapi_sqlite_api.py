@@ -12,6 +12,7 @@ import io
 import csv
 import traceback
 import requests
+import time  # ✅ CAMBIO: para cache-buster y backoff
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
@@ -390,15 +391,46 @@ def refresh_db():
     if not csv_url:
         raise HTTPException(500, "CSV_URL no está definido en variables de entorno.")
 
+    # ✅ CAMBIO: bloquear links de Google Drive por error
+    if "drive.google.com" in csv_url or "docs.google.com" in csv_url:
+        raise HTTPException(
+            500,
+            "CSV_URL apunta a Google Drive/Docs. Debe ser OneDrive/SharePoint (descarga directa)."
+        )
+
     try:
-        print(f">>> /refresh_db: iniciando con CSV_URL = {csv_url}")
-        resp = requests.get(csv_url, timeout=300)
-        print(f">>> /refresh_db: status descarga = {resp.status_code}")
-        if resp.status_code != 200:
+        # ✅ CAMBIO: cache-buster para evitar que SharePoint entregue versión cacheada
+        sep2 = "&" if "?" in csv_url else "?"
+        csv_url_nocache = f"{csv_url}{sep2}v={int(time.time())}"
+
+        print(f">>> /refresh_db: iniciando con CSV_URL = {csv_url_nocache}", flush=True)
+
+        headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+
+        # ✅ CAMBIO: reintentos con backoff para 429
+        resp = None
+        last_status = None
+        for attempt in range(1, 6):
+            resp = requests.get(csv_url_nocache, headers=headers, timeout=300)
+            last_status = resp.status_code
+            print(f">>> /refresh_db: intento {attempt} status descarga = {last_status}", flush=True)
+
+            if last_status == 200:
+                break
+
+            if last_status == 429:
+                wait_s = min(60, 2 ** attempt)  # 2,4,8,16,32 (máx 60)
+                print(f">>> /refresh_db: 429 demasiadas solicitudes, esperando {wait_s}s...", flush=True)
+                time.sleep(wait_s)
+                continue
+
+            break
+
+        if not resp or resp.status_code != 200:
             raise HTTPException(
                 500,
-                f"No se pudo descargar el CSV (status {resp.status_code}). "
-                f"Revisa que el enlace sea de descarga directa y público."
+                f"No se pudo descargar el CSV (status {last_status}). "
+                f"Revisa que el enlace sea de descarga directa y baja la frecuencia del cron."
             )
 
         content = resp.content
@@ -452,7 +484,7 @@ def refresh_db():
         raise
     except Exception as e:
         tb = traceback.format_exc()
-        print("ERROR en /refresh_db:", tb)
+        print("ERROR en /refresh_db:", tb, flush=True)
         raise HTTPException(500, f"Error interno al refrescar DB: {e}")
 
 # ---------- consulta cliente (solo SUBTOTAL) ----------
